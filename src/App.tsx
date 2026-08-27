@@ -1,8 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import "./index.css";
 
-import DEmblem from "./imports/d-emblem.png";
-
+const DEmblem = "/d-emblem.png";
 /* =========================================================
    TYPES
 ========================================================= */
