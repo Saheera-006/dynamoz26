@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import "./index.css";
+import { supabase } from "./lib/supabase";
 
 const DEmblem = "/d-emblem.png";
 /* =========================================================
@@ -443,6 +444,68 @@ const saveRegistration = (registration: Registration) => {
   );
 };
 
+const fetchCloudRegistrations = async (): Promise<Registration[]> => {
+  const { data: registrationRows, error: registrationError } =
+    await supabase
+      .from("registrations")
+      .select("registration_id, student_id, selected_events, teams, created_at")
+      .order("created_at", { ascending: false });
+
+  if (registrationError) {
+    throw registrationError;
+  }
+
+  if (!registrationRows?.length) return [];
+
+  const studentIds = Array.from(
+    new Set(
+      registrationRows
+        .map((row) => row.student_id)
+        .filter(Boolean)
+    )
+  );
+
+  const { data: studentRows, error: studentError } =
+    await supabase
+      .from("students")
+      .select("id, register_number, full_name, department, year, email, phone")
+      .in("id", studentIds);
+
+  if (studentError) {
+    throw studentError;
+  }
+
+  const studentsById = new Map(
+    (studentRows ?? []).map((student) => [student.id, student])
+  );
+
+  return registrationRows.flatMap((row) => {
+    const student = studentsById.get(row.student_id);
+    if (!student) return [];
+
+    return [
+      {
+        id: row.registration_id,
+        student: {
+          fullName: student.full_name ?? "",
+          registerNumber: student.register_number ?? "",
+          department: student.department ?? "",
+          year: student.year ?? "",
+          email: student.email ?? "",
+          phone: student.phone ?? "",
+        },
+        selectedEvents: Array.isArray(row.selected_events)
+          ? row.selected_events
+          : [],
+        teams: row.teams && typeof row.teams === "object"
+          ? row.teams
+          : {},
+        createdAt: row.created_at ?? "",
+      } satisfies Registration,
+    ];
+  });
+};
+
 const generateId = (prefix = "id") =>
   `${prefix}-${Date.now()}-${Math.random()
     .toString(36)
@@ -556,9 +619,8 @@ function Navbar({
         </button>
 
         <nav
-          className={`desktop-nav ${
-            menuOpen ? "mobile-open" : ""
-          }`}
+          className={`desktop-nav ${menuOpen ? "mobile-open" : ""
+            }`}
         >
           {navItems.map((item) => (
             <button
@@ -597,9 +659,8 @@ function Navbar({
         </button>
 
         <button
-          className={`hamburger ${
-            menuOpen ? "active" : ""
-          }`}
+          className={`hamburger ${menuOpen ? "active" : ""
+            }`}
           onClick={() => setMenuOpen((value) => !value)}
           aria-label="Toggle menu"
         >
@@ -933,9 +994,8 @@ function ValueItem({
 }) {
   return (
     <div
-      className={`value-item ${
-        light ? "light" : ""
-      }`}
+      className={`value-item ${light ? "light" : ""
+        }`}
     >
       <span className="value-icon">{icon}</span>
       <span>{title}</span>
@@ -1029,8 +1089,8 @@ function EventsSection({
               {item === "all"
                 ? "ALL"
                 : item === "technical"
-                ? "TECHNICAL"
-                : "NON-TECHNICAL"}
+                  ? "TECHNICAL"
+                  : "NON-TECHNICAL"}
             </button>
           ))}
         </div>
@@ -1550,6 +1610,43 @@ function RegistrationPage({
     }));
   };
 
+  useEffect(() => {
+    const registerNumber = student.registerNumber.trim();
+    if (!registerNumber) return;
+
+    const timer = window.setTimeout(async () => {
+      const { data, error } = await supabase
+        .from("students")
+        .select("full_name, register_number, department, year, email, phone")
+        .ilike("register_number", registerNumber)
+        .maybeSingle();
+
+      if (error) {
+        console.error("Student lookup failed:", error);
+        return;
+      }
+
+      if (!data) return;
+
+      setStudent((current) => {
+        if (current.registerNumber.trim().toLowerCase() !== registerNumber.toLowerCase()) {
+          return current;
+        }
+
+        return {
+          fullName: data.full_name ?? current.fullName,
+          registerNumber: data.register_number ?? current.registerNumber,
+          department: data.department ?? current.department,
+          year: data.year ?? current.year,
+          email: data.email ?? current.email,
+          phone: data.phone ?? current.phone,
+        };
+      });
+    }, 500);
+
+    return () => window.clearTimeout(timer);
+  }, [student.registerNumber]);
+
   const toggleEvent = (eventId: string) => {
     setSelectedEvents((current) => {
       if (current.includes(eventId)) {
@@ -1752,7 +1849,7 @@ function RegistrationPage({
     setStep((current) => current - 1);
   };
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (
       !config.registrationEnabled ||
       isRegistrationDeadlinePassed(
@@ -1766,21 +1863,237 @@ function RegistrationPage({
       return;
     }
 
-    const registration: Registration = {
-      id: generateRegistrationId(),
-      student,
-      selectedEvents,
-      teams,
-      createdAt: new Date().toISOString(),
-    };
+    if (!student.registerNumber.trim()) {
+      alert("Please enter your register number.");
+      return;
+    }
 
-    saveRegistration(registration);
+    if (!student.fullName.trim()) {
+      alert("Please enter your full name.");
+      return;
+    }
 
-    setSubmittedRegistration(
-      registration
-    );
+    if (selectedEvents.length === 0) {
+      alert("Please select at least one event.");
+      return;
+    }
 
-    setStep(5);
+    try {
+      const registerNumber =
+        student.registerNumber.trim();
+
+      // 1. CHECK EXISTING STUDENT
+      const {
+        data: existingStudent,
+        error: studentSearchError,
+      } = await supabase
+        .from("students")
+        .select("*")
+        .ilike(
+          "register_number",
+          registerNumber
+        )
+        .maybeSingle();
+
+      if (studentSearchError) {
+        console.error(
+          studentSearchError
+        );
+
+        alert(
+          "Unable to check student details."
+        );
+
+        return;
+      }
+
+      // 2. GET / CREATE STUDENT
+      let studentId: string;
+
+      if (existingStudent) {
+        studentId = existingStudent.id;
+
+        // Use latest cloud student details
+        const cloudStudent: StudentDetails = {
+          fullName:
+            existingStudent.full_name ?? "",
+          registerNumber:
+            existingStudent.register_number ?? "",
+          department:
+            existingStudent.department ?? "",
+          year:
+            existingStudent.year ?? "",
+          email:
+            existingStudent.email ?? "",
+          phone:
+            existingStudent.phone ?? "",
+        };
+
+        setStudent(cloudStudent);
+      } else {
+        const {
+          data: newStudent,
+          error: studentInsertError,
+        } = await supabase
+          .from("students")
+          .insert({
+            register_number:
+              registerNumber,
+            full_name:
+              student.fullName,
+            department:
+              student.department,
+            year:
+              student.year,
+            email:
+              student.email,
+            phone:
+              student.phone,
+          })
+          .select()
+          .single();
+
+        if (
+          studentInsertError ||
+          !newStudent
+        ) {
+          console.error(
+            studentInsertError
+          );
+
+          alert(
+            "Unable to save student details."
+          );
+
+          return;
+        }
+
+        studentId = newStudent.id;
+      }
+
+      // 3. CHECK PREVIOUS REGISTRATIONS
+      const {
+        data: previousRegistrations,
+        error:
+        registrationCheckError,
+      } = await supabase
+        .from("registrations")
+        .select("selected_events")
+        .eq(
+          "student_id",
+          studentId
+        );
+
+      if (registrationCheckError) {
+        console.error(
+          registrationCheckError
+        );
+
+        alert(
+          "Unable to check previous registrations."
+        );
+
+        return;
+      }
+
+      // 4. FIND DUPLICATE EVENTS
+      const alreadyRegisteredEvents =
+        previousRegistrations
+          ?.flatMap(
+            (registration) =>
+              Array.isArray(
+                registration.selected_events
+              )
+                ? registration.selected_events
+                : []
+          )
+          .filter((eventId) =>
+            selectedEvents.includes(
+              eventId
+            )
+          ) ?? [];
+
+      if (
+        alreadyRegisteredEvents.length > 0
+      ) {
+        const eventNames =
+          alreadyRegisteredEvents
+            .map(
+              (eventId) =>
+                events.find(
+                  (event) =>
+                    event.id === eventId
+                )?.name ?? eventId
+            )
+            .join(", ");
+
+        alert(
+          `Already registered for: ${eventNames}`
+        );
+
+        return;
+      }
+
+      // 5. CREATE REGISTRATION ID
+      const registrationId =
+        generateRegistrationId();
+
+      const createdAt =
+        new Date().toISOString();
+
+      // 6. SAVE TO SUPABASE
+      const {
+        error: registrationInsertError,
+      } = await supabase
+        .from("registrations")
+        .insert({
+          registration_id:
+            registrationId,
+          student_id:
+            studentId,
+          selected_events:
+            selectedEvents,
+          teams: teams,
+          created_at:
+            createdAt,
+        });
+
+      if (registrationInsertError) {
+        console.error(
+          registrationInsertError
+        );
+
+        alert(
+          "Registration failed. Please try again."
+        );
+
+        return;
+      }
+
+      // 7. SUCCESS SCREEN
+      const registration: Registration = {
+        id: registrationId,
+        student,
+        selectedEvents,
+        teams,
+        createdAt,
+      };
+
+      saveRegistration(registration);
+
+      setSubmittedRegistration(
+        registration
+      );
+
+      setStep(5);
+
+    } catch (error) {
+      console.error(error);
+
+      alert(
+        "Something went wrong. Please try again."
+      );
+    }
   };
 
   if (submittedRegistration) {
@@ -1983,11 +2296,10 @@ function RegistrationProgress({
         return (
           <React.Fragment key={label}>
             <div
-              className={`progress-step ${
-                number <= step
+              className={`progress-step ${number <= step
                   ? "active"
                   : ""
-              }`}
+                }`}
             >
               <span>
                 {number
@@ -2000,14 +2312,13 @@ function RegistrationProgress({
 
             {index <
               labels.length - 1 && (
-              <div
-                className={`progress-line ${
-                  number < step
-                    ? "active"
-                    : ""
-                }`}
-              />
-            )}
+                <div
+                  className={`progress-line ${number < step
+                      ? "active"
+                      : ""
+                    }`}
+                />
+              )}
           </React.Fragment>
         );
       })}
@@ -2297,11 +2608,10 @@ function EventSelectionGroup({
           return (
             <button
               key={event.id}
-              className={`registration-event ${
-                selected
+              className={`registration-event ${selected
                   ? "selected"
                   : ""
-              }`}
+                }`}
               onClick={() =>
                 toggleEvent(event.id)
               }
@@ -2323,7 +2633,7 @@ function EventSelectionGroup({
               <div className="registration-event-info">
                 <div className="registration-event-type">
                   {event.mode ===
-                  "team"
+                    "team"
                     ? `TEAM · ${event.teamSize}`
                     : "INDIVIDUAL"}
                 </div>
@@ -2690,7 +3000,7 @@ function ReviewStep({
 
                   <small>
                     {event.mode ===
-                    "team"
+                      "team"
                       ? "TEAM"
                       : "INDIVIDUAL"}
                   </small>
@@ -2703,97 +3013,97 @@ function ReviewStep({
 
       {Object.keys(teams).length >
         0 && (
-        <div className="review-section">
-          <div className="review-header">
-            <span>
-              TEAM DETAILS
-            </span>
+          <div className="review-section">
+            <div className="review-header">
+              <span>
+                TEAM DETAILS
+              </span>
 
-            <button
-              onClick={() =>
-                onEditStep(3)
-              }
-            >
-              EDIT
-            </button>
-          </div>
+              <button
+                onClick={() =>
+                  onEditStep(3)
+                }
+              >
+                EDIT
+              </button>
+            </div>
 
-          <div className="review-teams">
-            {Object.entries(
-              teams
-            ).map(
-              ([
-                eventId,
-                team,
-              ]) => {
-                const event =
-                  events.find(
-                    (item) =>
-                      item.id ===
-                      eventId
-                  );
+            <div className="review-teams">
+              {Object.entries(
+                teams
+              ).map(
+                ([
+                  eventId,
+                  team,
+                ]) => {
+                  const event =
+                    events.find(
+                      (item) =>
+                        item.id ===
+                        eventId
+                    );
 
-                if (!event)
-                  return null;
+                  if (!event)
+                    return null;
 
-                return (
-                  <div
-                    className="review-team"
-                    key={eventId}
-                  >
-                    <div className="review-team-title">
-                      <strong>
-                        {event.name}
-                      </strong>
+                  return (
+                    <div
+                      className="review-team"
+                      key={eventId}
+                    >
+                      <div className="review-team-title">
+                        <strong>
+                          {event.name}
+                        </strong>
 
-                      <span>
-                        {
-                          team.teamName
-                        }
-                      </span>
+                        <span>
+                          {
+                            team.teamName
+                          }
+                        </span>
+                      </div>
+
+                      {team.members.map(
+                        (
+                          member,
+                          index
+                        ) => (
+                          <div
+                            className="review-member"
+                            key={`${eventId}-${index}`}
+                          >
+                            <span>
+                              {(
+                                index + 1
+                              )
+                                .toString()
+                                .padStart(
+                                  2,
+                                  "0"
+                                )}
+                            </span>
+
+                            <strong>
+                              {
+                                member.name
+                              }
+                            </strong>
+
+                            <small>
+                              {
+                                member.registerNumber
+                              }
+                            </small>
+                          </div>
+                        )
+                      )}
                     </div>
-
-                    {team.members.map(
-                      (
-                        member,
-                        index
-                      ) => (
-                        <div
-                          className="review-member"
-                          key={`${eventId}-${index}`}
-                        >
-                          <span>
-                            {(
-                              index + 1
-                            )
-                              .toString()
-                              .padStart(
-                                2,
-                                "0"
-                              )}
-                          </span>
-
-                          <strong>
-                            {
-                              member.name
-                            }
-                          </strong>
-
-                          <small>
-                            {
-                              member.registerNumber
-                            }
-                          </small>
-                        </div>
-                      )
-                    )}
-                  </div>
-                );
-              }
-            )}
+                  );
+                }
+              )}
+            </div>
           </div>
-        </div>
-      )}
+        )}
     </div>
   );
 }
@@ -2958,7 +3268,7 @@ function AdminPage({
   const [selectedEventId, setSelectedEventId] =
     useState(
       getStoredEvents()[0]?.id ??
-        ""
+      ""
     );
 
   const selectedEvent =
@@ -2976,12 +3286,27 @@ function AdminPage({
     saveConfig(config);
   }, [config]);
 
-  const refreshRegistrations =
-    () => {
-      setRegistrations(
-        getStoredRegistrations()
+  const refreshRegistrations = async () => {
+    try {
+      const cloudRegistrations = await fetchCloudRegistrations();
+      setRegistrations(cloudRegistrations);
+
+      // Keep a local cache so the admin UI still has data if the network
+      // briefly disappears after a successful cloud fetch.
+      localStorage.setItem(
+        REGISTRATIONS_KEY,
+        JSON.stringify(cloudRegistrations)
       );
-    };
+    } catch (error) {
+      console.error("Unable to load cloud registrations:", error);
+      setRegistrations(getStoredRegistrations());
+      alert("Unable to load cloud registrations. Showing the local cache.");
+    }
+  };
+
+  useEffect(() => {
+    void refreshRegistrations();
+  }, []);
 
   const updateConfig = <
     K extends keyof SiteConfig
@@ -3003,9 +3328,9 @@ function AdminPage({
       current.map((event) =>
         event.id === eventId
           ? {
-              ...event,
-              ...updates,
-            }
+            ...event,
+            ...updates,
+          }
           : event
       )
     );
@@ -3080,10 +3405,9 @@ function AdminPage({
 
     const round: EventRound = {
       id: generateId("round"),
-      name: `ROUND ${
-        selectedEvent.rounds.length +
+      name: `ROUND ${selectedEvent.rounds.length +
         1
-      }`,
+        }`,
       description:
         "Add round description.",
       date: "2026-09-10",
@@ -3118,11 +3442,11 @@ function AdminPage({
           selectedEvent.rounds.map(
             (round) =>
               round.id ===
-              roundId
+                roundId
                 ? {
-                    ...round,
-                    ...updates,
-                  }
+                  ...round,
+                  ...updates,
+                }
                 : round
           ),
       }
@@ -3270,27 +3594,27 @@ function AdminSidebar({
     label: string;
     icon: string;
   }[] = [
-    {
-      id: "dashboard",
-      label: "DASHBOARD",
-      icon: "⌂",
-    },
-    {
-      id: "website",
-      label: "WEBSITE EDITOR",
-      icon: "✎",
-    },
-    {
-      id: "events",
-      label: "EVENT MANAGEMENT",
-      icon: "◆",
-    },
-    {
-      id: "registrations",
-      label: "REGISTRATIONS",
-      icon: "▣",
-    },
-  ];
+      {
+        id: "dashboard",
+        label: "DASHBOARD",
+        icon: "⌂",
+      },
+      {
+        id: "website",
+        label: "WEBSITE EDITOR",
+        icon: "✎",
+      },
+      {
+        id: "events",
+        label: "EVENT MANAGEMENT",
+        icon: "◆",
+      },
+      {
+        id: "registrations",
+        label: "REGISTRATIONS",
+        icon: "▣",
+      },
+    ];
 
   return (
     <aside className="admin-sidebar">
@@ -3647,15 +3971,15 @@ function AdminDashboard({
 
               {registrations.length ===
                 0 && (
-                <tr>
-                  <td
-                    colSpan={5}
-                    className="empty-admin"
-                  >
-                    NO REGISTRATIONS YET
-                  </td>
-                </tr>
-              )}
+                  <tr>
+                    <td
+                      colSpan={5}
+                      className="empty-admin"
+                    >
+                      NO REGISTRATIONS YET
+                    </td>
+                  </tr>
+                )}
             </tbody>
           </table>
         </div>
@@ -3718,9 +4042,9 @@ function WebsiteEditor({
         (person) =>
           person.id === id
             ? {
-                ...person,
-                ...updates,
-              }
+              ...person,
+              ...updates,
+            }
             : person
       )
     );
@@ -3905,11 +4229,10 @@ function WebsiteEditor({
           </div>
 
           <button
-            className={`admin-toggle ${
-              config.registrationEnabled
+            className={`admin-toggle ${config.registrationEnabled
                 ? "active"
                 : ""
-            }`}
+              }`}
             onClick={() =>
               updateConfig(
                 "registrationEnabled",
@@ -3930,10 +4253,10 @@ function WebsiteEditor({
             {!config.registrationEnabled
               ? "CLOSED BY ADMIN"
               : isRegistrationDeadlinePassed(
-                  config.registrationDeadline
-                )
-              ? "CLOSED — DEADLINE PASSED"
-              : "OPEN — ACCEPTING REGISTRATIONS"}
+                config.registrationDeadline
+              )
+                ? "CLOSED — DEADLINE PASSED"
+                : "OPEN — ACCEPTING REGISTRATIONS"}
           </strong>
         </div>
       </AdminEditorSection>
@@ -4302,7 +4625,7 @@ function EventEditor({
               key={event.id}
               className={
                 selectedEventId ===
-                event.id
+                  event.id
                   ? "active"
                   : ""
               }
@@ -4314,7 +4637,7 @@ function EventEditor({
             >
               <span>
                 {event.category ===
-                "technical"
+                  "technical"
                   ? "TECH"
                   : "NON"}
               </span>
@@ -4326,7 +4649,7 @@ function EventEditor({
 
                 <small>
                   {event.mode ===
-                  "team"
+                    "team"
                     ? `TEAM · ${event.teamSize}`
                     : "INDIVIDUAL"}
                 </small>
@@ -4474,12 +4797,12 @@ function EventEditor({
                             value as EventMode,
                           teamSize:
                             value ===
-                            "team"
+                              "team"
                               ? Math.max(
-                                  2,
-                                  selectedEvent.teamSize ||
-                                    4
-                                )
+                                2,
+                                selectedEvent.teamSize ||
+                                4
+                              )
                               : 1,
                         }
                       )
@@ -4488,30 +4811,30 @@ function EventEditor({
 
                   {selectedEvent.mode ===
                     "team" && (
-                    <AdminInput
-                      label="MAX TEAM SIZE"
-                      type="number"
-                      value={String(
-                        selectedEvent.teamSize
-                      )}
-                      onChange={(
-                        value
-                      ) =>
-                        updateEvent(
-                          selectedEvent.id,
-                          {
-                            teamSize:
-                              Math.max(
-                                2,
-                                Number(
-                                  value
-                                ) || 2
-                              ),
-                          }
-                        )
-                      }
-                    />
-                  )}
+                      <AdminInput
+                        label="MAX TEAM SIZE"
+                        type="number"
+                        value={String(
+                          selectedEvent.teamSize
+                        )}
+                        onChange={(
+                          value
+                        ) =>
+                          updateEvent(
+                            selectedEvent.id,
+                            {
+                              teamSize:
+                                Math.max(
+                                  2,
+                                  Number(
+                                    value
+                                  ) || 2
+                                ),
+                            }
+                          )
+                        }
+                      />
+                    )}
                 </div>
 
                 <AdminTextarea
@@ -4542,11 +4865,10 @@ function EventEditor({
                   </div>
 
                   <button
-                    className={`admin-toggle ${
-                      selectedEvent.enabled
+                    className={`admin-toggle ${selectedEvent.enabled
                         ? "active"
                         : ""
-                    }`}
+                      }`}
                     onClick={() =>
                       updateEvent(
                         selectedEvent.id,
@@ -4878,7 +5200,7 @@ function RegistrationManager({
       (registration) => {
         const matchesEvent =
           activeEvent ===
-            "all" ||
+          "all" ||
           registration.selectedEvents.includes(
             activeEvent
           );
@@ -4924,7 +5246,34 @@ function RegistrationManager({
     );
 
   const downloadData = () => {
+    const selectedEvent =
+      activeEvent === "all"
+        ? null
+        : events.find(
+          (event) => event.id === activeEvent
+        );
+
+    const eventName =
+      selectedEvent?.name ?? "All Events";
+
+    const exportRegistrations =
+      activeEvent === "all"
+        ? eventRegistrations
+        : eventRegistrations.filter(
+          (registration) =>
+            registration.selectedEvents.includes(
+              activeEvent
+            )
+        );
+
     const rows: string[][] = [
+      ["Dynamoz 26"],
+      ["Computer Science and Engineering"],
+      ["University College of Engineering Nagercoil"],
+      [""],
+      [`${eventName} Registration Report`],
+      [`Total Registration : ${exportRegistrations.length}`],
+      [""],
       [
         "Registration ID",
         "Name",
@@ -4939,7 +5288,7 @@ function RegistrationManager({
       ],
     ];
 
-    eventRegistrations.forEach(
+    exportRegistrations.forEach(
       (registration) => {
         const eventNames =
           registration.selectedEvents
@@ -4947,10 +5296,8 @@ function RegistrationManager({
               (eventId) =>
                 events.find(
                   (event) =>
-                    event.id ===
-                    eventId
-                )?.name ??
-                eventId
+                    event.id === eventId
+                )?.name ?? eventId
             )
             .join(" | ");
 
@@ -4959,54 +5306,52 @@ function RegistrationManager({
             registration.teams
           )
             .map(
-              ([
-                eventId,
-                team,
-              ]) => {
+              ([eventId, team]) => {
                 const event =
                   events.find(
                     (item) =>
-                      item.id ===
-                      eventId
+                      item.id === eventId
                   );
 
-                return `${event?.name ?? eventId}: ${team.teamName} — ${team.members
-                  .map(
-                    (member) =>
-                      `${member.name} (${member.registerNumber})`
-                  )
-                  .join(" | ")}`;
+                return `${event?.name ?? eventId}: ${team.teamName
+                  } — ${team.members
+                    .map(
+                      (member) =>
+                        `${member.name} (${member.registerNumber})`
+                    )
+                    .join(" | ")}`;
               }
             )
             .join(" || ");
 
         rows.push([
           registration.id,
-          registration.student
-            .fullName,
-          registration.student
-            .registerNumber,
-          registration.student
-            .department,
-          registration.student
-            .year,
-          registration.student
-            .email,
-          registration.student
-            .phone,
+          registration.student.fullName,
+          registration.student.registerNumber,
+          registration.student.department,
+          registration.student.year,
+          registration.student.email,
+          registration.student.phone,
           eventNames,
-          teamDetails ||
-            "Individual",
+          teamDetails || "Individual",
           registration.createdAt,
         ]);
       }
     );
 
-    downloadCSV(
-      "dynamoz26-registrations.csv",
-      rows
-    );
+    const safeEventName =
+      eventName
+        .replace(/[^a-zA-Z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "");
+
+    const filename =
+      activeEvent === "all"
+        ? "Dynamoz26_All_Registrations.csv"
+        : `Dynamoz26_${safeEventName}_Registrations.csv`;
+
+    downloadCSV(filename, rows);
   };
+
 
   return (
     <div className="admin-editor">
@@ -5040,7 +5385,7 @@ function RegistrationManager({
           <button
             className={
               activeEvent ===
-              "all"
+                "all"
                 ? "active"
                 : ""
             }
@@ -5059,7 +5404,7 @@ function RegistrationManager({
                 key={event.id}
                 className={
                   activeEvent ===
-                  event.id
+                    event.id
                     ? "active"
                     : ""
                 }
@@ -5115,14 +5460,14 @@ function RegistrationManager({
 
           <strong>
             {activeEvent ===
-            "all"
+              "all"
               ? "ALL EVENTS"
               : events.find(
-                  (event) =>
-                    event.id ===
-                    activeEvent
-                )?.name ??
-                "EVENT"}
+                (event) =>
+                  event.id ===
+                  activeEvent
+              )?.name ??
+              "EVENT"}
           </strong>
         </div>
       </div>
@@ -5277,15 +5622,15 @@ function RegistrationManager({
 
               {eventRegistrations.length ===
                 0 && (
-                <tr>
-                  <td
-                    colSpan={9}
-                    className="empty-admin"
-                  >
-                    NO REGISTRATIONS FOUND
-                  </td>
-                </tr>
-              )}
+                  <tr>
+                    <td
+                      colSpan={9}
+                      className="empty-admin"
+                    >
+                      NO REGISTRATIONS FOUND
+                    </td>
+                  </tr>
+                )}
             </tbody>
           </table>
         </div>
