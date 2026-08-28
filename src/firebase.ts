@@ -1,4 +1,9 @@
 import { initializeApp } from "firebase/app";
+import {
+  getAuth,
+  browserSessionPersistence,
+  setPersistence,
+} from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
 
 const firebaseConfig = {
@@ -13,3 +18,8 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 
 export const db = getFirestore(app);
+
+export const auth = getAuth(app);
+
+// Keep admin authentication only for the current browser session.
+void setPersistence(auth, browserSessionPersistence);

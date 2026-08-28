@@ -10,7 +10,13 @@ import {
   setDoc,
   where,
 } from "firebase/firestore";
-import { db } from "./firebase";
+import { db, auth } from "./firebase";
+import {
+  signInWithEmailAndPassword,
+  signOut,
+  onAuthStateChanged,
+  type User,
+} from "firebase/auth";
 
 const DEmblem = "/d-emblem.png";
 /* =========================================================
@@ -3062,33 +3068,48 @@ function AdminLogin({
 }: {
   onLogin: () => void;
 }) {
-  const [username, setUsername] =
-    useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
 
-  const [password, setPassword] =
-    useState("");
-
-  const login = (
+  const login = async (
     event: React.FormEvent
   ) => {
     event.preventDefault();
 
-    if (
-      username === "admin" &&
-      password === "dynamoz26"
-    ) {
-      localStorage.setItem(
-        "dynamoz26_admin_auth",
-        "true"
+    // Only one username is allowed.
+    if (username.trim().toLowerCase() !== "admin") {
+      alert("Invalid username or password.");
+      return;
+    }
+
+    if (!password) {
+      alert("Please enter your password.");
+      return;
+    }
+
+    setIsLoggingIn(true);
+
+    try {
+      await signInWithEmailAndPassword(
+        auth,
+        "admin@dynamoz26.com",
+        password
       );
 
       onLogin();
-    } else {
-      alert(
-        "Invalid username or password."
+    } catch (error) {
+      console.error(
+        "Firebase admin login error:",
+        error
       );
+
+      alert("Invalid username or password.");
+    } finally {
+      setIsLoggingIn(false);
     }
   };
+
 
   return (
     <div className="admin-login-page">
@@ -3491,12 +3512,13 @@ function AdminPage({
     );
   };
 
-  const logout = () => {
-    localStorage.removeItem(
-      "dynamoz26_admin_auth"
-    );
-
-    onLogout();
+  const logout = async () => {
+    try {
+      await signOut(auth);
+      onLogout();
+    } catch (error) {
+      console.error("Firebase admin logout error:", error);
+    }
   };
 
   if (!selectedEvent && tab === "events") {
@@ -6016,12 +6038,29 @@ export default function App() {
       getStoredConfig()
     );
 
-  const [adminAuthenticated, setAdminAuthenticated] =
-    useState(
-      localStorage.getItem(
-        "dynamoz26_admin_auth"
-      ) === "true"
-    );
+  const [adminUser, setAdminUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
+  const ADMIN_UID = "S5YTAtfh06YSO75Zxfqid4lgM2F3";
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user && user.uid === ADMIN_UID) {
+        setAdminUser(user);
+      } else {
+        if (user) {
+          await signOut(auth).catch((error) =>
+            console.error("Unable to sign out unauthorized user:", error)
+          );
+        }
+        setAdminUser(null);
+      }
+
+      setAuthLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, []);
 
   useEffect(() => {
     const handlePopState =
@@ -6148,35 +6187,27 @@ export default function App() {
     };
 
   const logoutAdmin = () => {
-    localStorage.removeItem(
-      "dynamoz26_admin_auth"
-    );
-
-    setAdminAuthenticated(
-      false
-    );
+    setAdminUser(null);
   };
 
   if (path === "/admin") {
-    if (!adminAuthenticated) {
+    if (authLoading) {
       return (
-        <AdminLogin
-          onLogin={() =>
-            setAdminAuthenticated(
-              true
-            )
-          }
-        />
+        <div className="admin-login-page">
+          <div className="admin-login-card">
+            <img src={DEmblem} alt="DYNAMOZ" />
+            <div className="registration-kicker">DYNAMOZ 26 / SECURE ACCESS</div>
+            <h1>VERIFYING<br /><span>ACCESS</span></h1>
+          </div>
+        </div>
       );
     }
 
-    return (
-      <AdminPage
-        onLogout={
-          logoutAdmin
-        }
-      />
-    );
+    if (!adminUser) {
+      return <AdminLogin onLogin={() => {}} />;
+    }
+
+    return <AdminPage onLogout={logoutAdmin} />;
   }
 
   if (registrationOpen) {
