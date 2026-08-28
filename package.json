@@ -1,5 +1,5 @@
 {
-  "name": "figma-make-app",
+  "name": "dynamoz",
   "private": true,
   "version": "1.0.0",
   "type": "module",
@@ -10,7 +10,7 @@
     "format": "oxfmt"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.112.4",
+    "firebase": "^12.18.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

@@ -1,6 +1,16 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import "./index.css";
-import { supabase } from "./lib/supabase";
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  onSnapshot,
+  query,
+  setDoc,
+  where,
+} from "firebase/firestore";
+import { db } from "./firebase";
 
 const DEmblem = "/d-emblem.png";
 /* =========================================================
@@ -415,34 +425,65 @@ const getStoredRegistrations = (): Registration[] => {
   }
 };
 
-const saveRegistration = (registration: Registration) => {
+const normalizeRegisterNumber = (value: string) =>
+  value.trim().toLowerCase();
+
+const saveRegistration = async (registration: Registration) => {
+  const registerNumber = normalizeRegisterNumber(
+    registration.student.registerNumber
+  );
+
+  // Keep a local cache for offline-friendly admin rendering.
   const existing = getStoredRegistrations();
+  const withoutDuplicate = existing.filter(
+    (item) =>
+      normalizeRegisterNumber(item.student.registerNumber) !==
+      registerNumber
+  );
+
   localStorage.setItem(
     REGISTRATIONS_KEY,
-    JSON.stringify([...existing, registration])
+    JSON.stringify([...withoutDuplicate, registration])
+  );
+
+  // Registration ID is used as the Firestore document ID.
+  // The register number is duplicated at top-level so Firestore can query it.
+  await setDoc(
+    doc(db, "registrations", registration.id),
+    {
+      ...registration,
+      studentRegisterNumber: registerNumber,
+    }
+  );
+
+  // One canonical student document per register number.
+  await setDoc(
+    doc(db, "students", registerNumber),
+    registration.student,
+    { merge: true }
   );
 };
 
 const fetchCloudAppState = async () => {
-  const { data, error } = await supabase
-    .from(APP_STATE_TABLE)
-    .select("key, value")
-    .in("key", [EVENTS_KEY, CONFIG_KEY]);
+  const [eventsSnap, configSnap] = await Promise.all([
+    getDoc(doc(db, APP_STATE_TABLE, EVENTS_KEY)),
+    getDoc(doc(db, APP_STATE_TABLE, CONFIG_KEY)),
+  ]);
 
-  if (error) throw error;
-
-  const map = new Map(
-    (data ?? []).map((row) => [row.key, row.value])
-  );
+  const eventsData = eventsSnap.exists()
+    ? eventsSnap.data().value
+    : null;
+  const configData = configSnap.exists()
+    ? configSnap.data().value
+    : null;
 
   return {
-    events: Array.isArray(map.get(EVENTS_KEY))
-      ? (map.get(EVENTS_KEY) as EventItem[])
+    events: Array.isArray(eventsData)
+      ? (eventsData as EventItem[])
       : null,
     config:
-      map.get(CONFIG_KEY) &&
-      typeof map.get(CONFIG_KEY) === "object"
-        ? (map.get(CONFIG_KEY) as SiteConfig)
+      configData && typeof configData === "object"
+        ? (configData as SiteConfig)
         : null,
   };
 };
@@ -451,60 +492,48 @@ const saveCloudAppState = async (
   key: string,
   value: unknown
 ) => {
-  const { error } = await supabase
-    .from(APP_STATE_TABLE)
-    .upsert(
-      { key, value },
-      { onConflict: "key" }
-    );
-
-  if (error) throw error;
+  await setDoc(
+    doc(db, APP_STATE_TABLE, key),
+    {
+      key,
+      value,
+      updatedAt: new Date().toISOString(),
+    },
+    { merge: true }
+  );
 };
 
 const fetchCloudRegistrations = async (): Promise<Registration[]> => {
-  const { data: registrationRows, error: registrationError } =
-    await supabase
-      .from("registrations")
-      .select("registration_id, student_id, selected_events, teams, created_at")
-      .order("created_at", { ascending: false });
-
-  if (registrationError) throw registrationError;
-  if (!registrationRows?.length) return [];
-
-  const studentIds = Array.from(
-    new Set(registrationRows.map((row) => row.student_id).filter(Boolean))
+  const snapshot = await getDocs(
+    collection(db, "registrations")
   );
 
-  const { data: studentRows, error: studentError } = await supabase
-    .from("students")
-    .select("id, register_number, full_name, department, year, email, phone")
-    .in("id", studentIds);
+  const registrations = snapshot.docs.map((item) => {
+    const data = item.data() as Registration & {
+      studentRegisterNumber?: string;
+    };
 
-  if (studentError) throw studentError;
-
-  const studentsById = new Map(
-    (studentRows ?? []).map((student) => [student.id, student])
-  );
-
-  return registrationRows.flatMap((row) => {
-    const student = studentsById.get(row.student_id);
-    if (!student) return [];
-
-    return [{
-      id: row.registration_id,
-      student: {
-        fullName: student.full_name ?? "",
-        registerNumber: student.register_number ?? "",
-        department: student.department ?? "",
-        year: student.year ?? "",
-        email: student.email ?? "",
-        phone: student.phone ?? "",
-      },
-      selectedEvents: Array.isArray(row.selected_events) ? row.selected_events : [],
-      teams: row.teams && typeof row.teams === "object" ? row.teams : {},
-      createdAt: row.created_at ?? "",
-    } satisfies Registration];
+    return {
+      id: data.id ?? item.id,
+      student: data.student,
+      selectedEvents: Array.isArray(data.selectedEvents)
+        ? data.selectedEvents
+        : [],
+      teams:
+        data.teams && typeof data.teams === "object"
+          ? data.teams
+          : {},
+      createdAt: data.createdAt ?? "",
+    } satisfies Registration;
   });
+
+  registrations.sort(
+    (a, b) =>
+      new Date(b.createdAt).getTime() -
+      new Date(a.createdAt).getTime()
+  );
+
+  return registrations;
 };
 
 const generateId = (prefix = "id") =>
@@ -1615,34 +1644,38 @@ function RegistrationPage({
     const registerNumber = student.registerNumber.trim();
     if (!registerNumber) return;
 
+    const normalized = normalizeRegisterNumber(registerNumber);
+
     const timer = window.setTimeout(async () => {
-      const { data, error } = await supabase
-        .from("students")
-        .select("full_name, register_number, department, year, email, phone")
-        .ilike("register_number", registerNumber)
-        .maybeSingle();
+      try {
+        const studentSnap = await getDoc(
+          doc(db, "students", normalized)
+        );
 
-      if (error) {
+        if (!studentSnap.exists()) return;
+
+        const data = studentSnap.data() as StudentDetails;
+
+        setStudent((current) => {
+          if (
+            normalizeRegisterNumber(current.registerNumber) !==
+            normalized
+          ) {
+            return current;
+          }
+
+          return {
+            fullName: data.fullName ?? current.fullName,
+            registerNumber: data.registerNumber ?? current.registerNumber,
+            department: data.department ?? current.department,
+            year: data.year ?? current.year,
+            email: data.email ?? current.email,
+            phone: data.phone ?? current.phone,
+          };
+        });
+      } catch (error) {
         console.error("Student lookup failed:", error);
-        return;
       }
-
-      if (!data) return;
-
-      setStudent((current) => {
-        if (current.registerNumber.trim().toLowerCase() !== registerNumber.toLowerCase()) {
-          return current;
-        }
-
-        return {
-          fullName: data.full_name ?? current.fullName,
-          registerNumber: data.register_number ?? current.registerNumber,
-          department: data.department ?? current.department,
-          year: data.year ?? current.year,
-          email: data.email ?? current.email,
-          phone: data.phone ?? current.phone,
-        };
-      });
     }, 500);
 
     return () => window.clearTimeout(timer);
@@ -1851,22 +1884,21 @@ function RegistrationPage({
   };
 
   const checkExistingStudent = async (registerNumber: string) => {
-    const value = registerNumber.trim();
+    const value = normalizeRegisterNumber(registerNumber);
     if (!value) return;
 
     try {
-      const { data, error } = await supabase
-        .from("students")
-        .select("*")
-        .ilike("register_number", value)
-        .maybeSingle();
+      const snapshot = await getDoc(
+        doc(db, "students", value)
+      );
 
-      if (error) throw error;
-      if (!data) return;
+      if (!snapshot.exists()) return;
+
+      const data = snapshot.data() as StudentDetails;
 
       setStudent({
-        fullName: data.full_name ?? "",
-        registerNumber: data.register_number ?? value,
+        fullName: data.fullName ?? "",
+        registerNumber: data.registerNumber ?? registerNumber.trim(),
         department: data.department ?? "",
         year: data.year ?? "",
         email: data.email ?? "",
@@ -1884,10 +1916,7 @@ function RegistrationPage({
         config.registrationDeadline
       )
     ) {
-      alert(
-        "Registration deadline has passed."
-      );
-
+      alert("Registration deadline has passed.");
       return;
     }
 
@@ -1907,199 +1936,70 @@ function RegistrationPage({
     }
 
     try {
-      const registerNumber = student.registerNumber.trim();
+      const registerNumber = normalizeRegisterNumber(
+        student.registerNumber
+      );
+
       let currentStudent = student;
 
-      // 1. CHECK EXISTING STUDENT
-      const {
-        data: existingStudent,
-        error: studentSearchError,
-      } = await supabase
-        .from("students")
-        .select("*")
-        .ilike(
-          "register_number",
-          registerNumber
-        )
-        .maybeSingle();
+      // 1. Find the canonical student record by register number.
+      const studentSnap = await getDoc(
+        doc(db, "students", registerNumber)
+      );
 
-      if (studentSearchError) {
-        console.error(
-          studentSearchError
-        );
+      if (studentSnap.exists()) {
+        const data = studentSnap.data() as StudentDetails;
 
-        alert(
-          "Unable to check student details."
-        );
-
-        return;
-      }
-
-      // 2. GET / CREATE STUDENT
-      let studentId: string;
-
-      if (existingStudent) {
-        studentId = existingStudent.id;
-
-        // Use latest cloud student details
-        const cloudStudent: StudentDetails = {
-          fullName:
-            existingStudent.full_name ?? "",
-          registerNumber:
-            existingStudent.register_number ?? "",
-          department:
-            existingStudent.department ?? "",
-          year:
-            existingStudent.year ?? "",
-          email:
-            existingStudent.email ?? "",
-          phone:
-            existingStudent.phone ?? "",
+        currentStudent = {
+          fullName: data.fullName ?? "",
+          registerNumber: data.registerNumber ?? student.registerNumber.trim(),
+          department: data.department ?? "",
+          year: data.year ?? "",
+          email: data.email ?? "",
+          phone: data.phone ?? "",
         };
 
-        currentStudent = cloudStudent;
-        setStudent(cloudStudent);
-      } else {
-        const {
-          data: newStudent,
-          error: studentInsertError,
-        } = await supabase
-          .from("students")
-          .insert({
-            register_number:
-              registerNumber,
-            full_name:
-              student.fullName,
-            department:
-              student.department,
-            year:
-              student.year,
-            email:
-              student.email,
-            phone:
-              student.phone,
-          })
-          .select()
-          .single();
-
-        if (
-          studentInsertError ||
-          !newStudent
-        ) {
-          console.error(
-            studentInsertError
-          );
-
-          alert(
-            "Unable to save student details."
-          );
-
-          return;
-        }
-
-        studentId = newStudent.id;
+        setStudent(currentStudent);
       }
 
-      // 3. CHECK PREVIOUS REGISTRATIONS
-      const {
-        data: previousRegistrations,
-        error:
-        registrationCheckError,
-      } = await supabase
-        .from("registrations")
-        .select("selected_events")
-        .eq(
-          "student_id",
-          studentId
-        );
+      // 2. Find previous registrations for this register number.
+      const previousSnapshot = await getDocs(
+        query(
+          collection(db, "registrations"),
+          where("studentRegisterNumber", "==", registerNumber)
+        )
+      );
 
-      if (registrationCheckError) {
-        console.error(
-          registrationCheckError
-        );
+      const previousRegistrations = previousSnapshot.docs.map(
+        (item) => item.data() as Registration
+      );
 
-        alert(
-          "Unable to check previous registrations."
-        );
+      // 3. Prevent registering for the same event twice.
+      const alreadyRegisteredEvents = previousRegistrations
+        .flatMap((registration) =>
+          Array.isArray(registration.selectedEvents)
+            ? registration.selectedEvents
+            : []
+        )
+        .filter((eventId) => selectedEvents.includes(eventId));
 
-        return;
-      }
-
-      // 4. FIND DUPLICATE EVENTS
-      const alreadyRegisteredEvents =
-        previousRegistrations
-          ?.flatMap(
-            (registration) =>
-              Array.isArray(
-                registration.selected_events
-              )
-                ? registration.selected_events
-                : []
-          )
-          .filter((eventId) =>
-            selectedEvents.includes(
+      if (alreadyRegisteredEvents.length > 0) {
+        const eventNames = alreadyRegisteredEvents
+          .map(
+            (eventId) =>
+              events.find((event) => event.id === eventId)?.name ??
               eventId
-            )
-          ) ?? [];
+          )
+          .join(", ");
 
-      if (
-        alreadyRegisteredEvents.length > 0
-      ) {
-        const eventNames =
-          alreadyRegisteredEvents
-            .map(
-              (eventId) =>
-                events.find(
-                  (event) =>
-                    event.id === eventId
-                )?.name ?? eventId
-            )
-            .join(", ");
-
-        alert(
-          `Already registered for: ${eventNames}`
-        );
-
+        alert(`Already registered for: ${eventNames}`);
         return;
       }
 
-      // 5. CREATE REGISTRATION ID
-      const registrationId =
-        generateRegistrationId();
+      // 4. Create and save the new registration.
+      const registrationId = generateRegistrationId();
+      const createdAt = new Date().toISOString();
 
-      const createdAt =
-        new Date().toISOString();
-
-      // 6. SAVE TO SUPABASE
-      const {
-        error: registrationInsertError,
-      } = await supabase
-        .from("registrations")
-        .insert({
-          registration_id:
-            registrationId,
-          student_id:
-            studentId,
-          selected_events:
-            selectedEvents,
-          teams: teams,
-          created_at:
-            createdAt,
-        });
-
-      if (registrationInsertError) {
-        console.error(
-          registrationInsertError
-        );
-
-        alert(
-          "Registration failed. Please try again."
-        );
-
-        return;
-      }
-
-      // 7. SUCCESS SCREEN
       const registration: Registration = {
         id: registrationId,
         student: currentStudent,
@@ -2108,19 +2008,14 @@ function RegistrationPage({
         createdAt,
       };
 
-      saveRegistration(registration);
+      await saveRegistration(registration);
 
-      setSubmittedRegistration(
-        registration
-      );
-
+      setSubmittedRegistration(registration);
       setStep(5);
-
     } catch (error) {
-      console.error(error);
-
+      console.error("Registration failed:", error);
       alert(
-        "Something went wrong. Please try again."
+        "Registration failed. Please check your internet connection and try again."
       );
     }
   };
@@ -3303,6 +3198,8 @@ function AdminPage({
     useState(getStoredEvents()[0]?.id ?? "");
 
   const [cloudHydrated, setCloudHydrated] = useState(false);
+  const skipNextEventsSave = useRef(false);
+  const skipNextConfigSave = useRef(false);
 
   const selectedEvent =
     events.find(
@@ -3313,10 +3210,16 @@ function AdminPage({
 
   useEffect(() => {
     if (!cloudHydrated) return;
+
+    if (skipNextEventsSave.current) {
+      skipNextEventsSave.current = false;
+      return;
+    }
+
     saveEvents(events);
     const timer = window.setTimeout(() => {
       void saveCloudAppState(EVENTS_KEY, events).catch((error) =>
-        console.error("Unable to save events to Supabase:", error)
+        console.error("Unable to save events to Firebase:", error)
       );
     }, 500);
     return () => window.clearTimeout(timer);
@@ -3324,52 +3227,95 @@ function AdminPage({
 
   useEffect(() => {
     if (!cloudHydrated) return;
+
+    if (skipNextConfigSave.current) {
+      skipNextConfigSave.current = false;
+      return;
+    }
+
     saveConfig(config);
     const timer = window.setTimeout(() => {
       void saveCloudAppState(CONFIG_KEY, config).catch((error) =>
-        console.error("Unable to save site config to Supabase:", error)
+        console.error("Unable to save site config to Firebase:", error)
       );
     }, 500);
     return () => window.clearTimeout(timer);
   }, [config, cloudHydrated]);
 
   useEffect(() => {
-    const loadCloudState = async () => {
-      try {
-        const cloud = await fetchCloudAppState();
-        if (cloud.events) {
-          setEvents(cloud.events);
-          localStorage.setItem(EVENTS_KEY, JSON.stringify(cloud.events));
+    let eventsReady = false;
+    let configReady = false;
+
+    const unsubscribeEvents = onSnapshot(
+      doc(db, APP_STATE_TABLE, EVENTS_KEY),
+      (snapshot) => {
+        const value = snapshot.exists() ? snapshot.data().value : null;
+        if (Array.isArray(value)) {
+          skipNextEventsSave.current = true;
+          setEvents(value as EventItem[]);
+          saveEvents(value as EventItem[]);
           setSelectedEventId((current) =>
-            cloud.events?.some((event) => event.id === current)
+            (value as EventItem[]).some((event) => event.id === current)
               ? current
-              : cloud.events?.[0]?.id ?? ""
+              : (value as EventItem[])[0]?.id ?? ""
           );
         }
-        if (cloud.config) {
-          setConfig({ ...DEFAULT_CONFIG, ...cloud.config });
-          localStorage.setItem(CONFIG_KEY, JSON.stringify({ ...DEFAULT_CONFIG, ...cloud.config }));
+        eventsReady = true;
+        if (eventsReady && configReady) setCloudHydrated(true);
+      },
+      (error) => console.error("Firebase events listener error:", error)
+    );
+
+    const unsubscribeConfig = onSnapshot(
+      doc(db, APP_STATE_TABLE, CONFIG_KEY),
+      (snapshot) => {
+        const value = snapshot.exists() ? snapshot.data().value : null;
+        if (value && typeof value === "object") {
+          const merged = { ...DEFAULT_CONFIG, ...(value as Partial<SiteConfig>) };
+          skipNextConfigSave.current = true;
+          setConfig(merged);
+          saveConfig(merged);
         }
-      } catch (error) {
-        console.error("Unable to load admin data from Supabase:", error);
-      } finally {
-        setCloudHydrated(true);
-      }
+        configReady = true;
+        if (eventsReady && configReady) setCloudHydrated(true);
+      },
+      (error) => console.error("Firebase config listener error:", error)
+    );
+
+    const unsubscribeRegistrations = onSnapshot(
+      collection(db, "registrations"),
+      (snapshot) => {
+        const cloudRegistrations = snapshot.docs
+          .map((item) => {
+            const data = item.data() as Registration & { studentRegisterNumber?: string };
+            return {
+              id: data.id ?? item.id,
+              student: data.student,
+              selectedEvents: Array.isArray(data.selectedEvents) ? data.selectedEvents : [],
+              teams: data.teams && typeof data.teams === "object" ? data.teams : {},
+              createdAt: data.createdAt ?? "",
+            } satisfies Registration;
+          })
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+        setRegistrations(cloudRegistrations);
+        localStorage.setItem(REGISTRATIONS_KEY, JSON.stringify(cloudRegistrations));
+      },
+      (error) => console.error("Firebase registrations listener error:", error)
+    );
+
+    return () => {
+      unsubscribeEvents();
+      unsubscribeConfig();
+      unsubscribeRegistrations();
     };
-    void loadCloudState();
   }, []);
 
   const refreshRegistrations = async () => {
     try {
       const cloudRegistrations = await fetchCloudRegistrations();
       setRegistrations(cloudRegistrations);
-
-      // Keep a local cache so the admin UI still has data if the network
-      // briefly disappears after a successful cloud fetch.
-      localStorage.setItem(
-        REGISTRATIONS_KEY,
-        JSON.stringify(cloudRegistrations)
-      );
+      localStorage.setItem(REGISTRATIONS_KEY, JSON.stringify(cloudRegistrations));
     } catch (error) {
       console.error("Unable to load cloud registrations:", error);
       setRegistrations(getStoredRegistrations());
@@ -6099,16 +6045,35 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const loadPublicCloudState = async () => {
-      try {
-        const cloud = await fetchCloudAppState();
-        if (cloud.events) setEvents(cloud.events);
-        if (cloud.config) setConfig({ ...DEFAULT_CONFIG, ...cloud.config });
-      } catch (error) {
-        console.error("Unable to load public cloud state:", error);
-      }
+    const unsubscribeEvents = onSnapshot(
+      doc(db, APP_STATE_TABLE, EVENTS_KEY),
+      (snapshot) => {
+        const value = snapshot.exists() ? snapshot.data().value : null;
+        if (Array.isArray(value)) {
+          setEvents(value as EventItem[]);
+          saveEvents(value as EventItem[]);
+        }
+      },
+      (error) => console.error("Firebase public events listener error:", error)
+    );
+
+    const unsubscribeConfig = onSnapshot(
+      doc(db, APP_STATE_TABLE, CONFIG_KEY),
+      (snapshot) => {
+        const value = snapshot.exists() ? snapshot.data().value : null;
+        if (value && typeof value === "object") {
+          const merged = { ...DEFAULT_CONFIG, ...(value as Partial<SiteConfig>) };
+          setConfig(merged);
+          saveConfig(merged);
+        }
+      },
+      (error) => console.error("Firebase public config listener error:", error)
+    );
+
+    return () => {
+      unsubscribeEvents();
+      unsubscribeConfig();
     };
-    void loadPublicCloudState();
   }, []);
 
   useEffect(() => {
