@@ -364,18 +364,14 @@ const DEFAULT_CONFIG: SiteConfig = {
 const EVENTS_KEY = "dynamoz26_events";
 const CONFIG_KEY = "dynamoz26_site_config";
 const REGISTRATIONS_KEY = "dynamoz26_registrations";
+const APP_STATE_TABLE = "app_state";
 
 const getStoredEvents = (): EventItem[] => {
   try {
     const raw = localStorage.getItem(EVENTS_KEY);
-
     if (!raw) return DEFAULT_EVENTS;
-
     const parsed = JSON.parse(raw) as EventItem[];
-
-    if (!Array.isArray(parsed)) return DEFAULT_EVENTS;
-
-    return parsed;
+    return Array.isArray(parsed) ? parsed : DEFAULT_EVENTS;
   } catch {
     return DEFAULT_EVENTS;
   }
@@ -388,30 +384,15 @@ const saveEvents = (events: EventItem[]) => {
 const getStoredConfig = (): SiteConfig => {
   try {
     const raw = localStorage.getItem(CONFIG_KEY);
-
     if (!raw) return DEFAULT_CONFIG;
-
     const stored = JSON.parse(raw) as Partial<SiteConfig>;
-
-    // Migrate the older demo dates once, while preserving any other
-    // values the admin may already have edited.
     if (stored.eventDate === "2026-09-10T00:00:00") {
       stored.eventDate = DEFAULT_CONFIG.eventDate;
     }
-
-    if (
-      stored.registrationDeadline ===
-      "2026-09-05T23:59:59"
-    ) {
-      stored.registrationDeadline =
-        DEFAULT_CONFIG.registrationDeadline;
+    if (stored.registrationDeadline === "2026-09-05T23:59:59") {
+      stored.registrationDeadline = DEFAULT_CONFIG.registrationDeadline;
     }
-
-    const merged = {
-      ...DEFAULT_CONFIG,
-      ...stored,
-    };
-
+    const merged = { ...DEFAULT_CONFIG, ...stored };
     localStorage.setItem(CONFIG_KEY, JSON.stringify(merged));
     return merged;
   } catch {
@@ -426,10 +407,9 @@ const saveConfig = (config: SiteConfig) => {
 const getStoredRegistrations = (): Registration[] => {
   try {
     const raw = localStorage.getItem(REGISTRATIONS_KEY);
-
     if (!raw) return [];
-
-    return JSON.parse(raw) as Registration[];
+    const parsed = JSON.parse(raw) as Registration[];
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
     return [];
   }
@@ -437,11 +417,48 @@ const getStoredRegistrations = (): Registration[] => {
 
 const saveRegistration = (registration: Registration) => {
   const existing = getStoredRegistrations();
-
   localStorage.setItem(
     REGISTRATIONS_KEY,
     JSON.stringify([...existing, registration])
   );
+};
+
+const fetchCloudAppState = async () => {
+  const { data, error } = await supabase
+    .from(APP_STATE_TABLE)
+    .select("key, value")
+    .in("key", [EVENTS_KEY, CONFIG_KEY]);
+
+  if (error) throw error;
+
+  const map = new Map(
+    (data ?? []).map((row) => [row.key, row.value])
+  );
+
+  return {
+    events: Array.isArray(map.get(EVENTS_KEY))
+      ? (map.get(EVENTS_KEY) as EventItem[])
+      : null,
+    config:
+      map.get(CONFIG_KEY) &&
+      typeof map.get(CONFIG_KEY) === "object"
+        ? (map.get(CONFIG_KEY) as SiteConfig)
+        : null,
+  };
+};
+
+const saveCloudAppState = async (
+  key: string,
+  value: unknown
+) => {
+  const { error } = await supabase
+    .from(APP_STATE_TABLE)
+    .upsert(
+      { key, value },
+      { onConflict: "key" }
+    );
+
+  if (error) throw error;
 };
 
 const fetchCloudRegistrations = async (): Promise<Registration[]> => {
@@ -451,29 +468,19 @@ const fetchCloudRegistrations = async (): Promise<Registration[]> => {
       .select("registration_id, student_id, selected_events, teams, created_at")
       .order("created_at", { ascending: false });
 
-  if (registrationError) {
-    throw registrationError;
-  }
-
+  if (registrationError) throw registrationError;
   if (!registrationRows?.length) return [];
 
   const studentIds = Array.from(
-    new Set(
-      registrationRows
-        .map((row) => row.student_id)
-        .filter(Boolean)
-    )
+    new Set(registrationRows.map((row) => row.student_id).filter(Boolean))
   );
 
-  const { data: studentRows, error: studentError } =
-    await supabase
-      .from("students")
-      .select("id, register_number, full_name, department, year, email, phone")
-      .in("id", studentIds);
+  const { data: studentRows, error: studentError } = await supabase
+    .from("students")
+    .select("id, register_number, full_name, department, year, email, phone")
+    .in("id", studentIds);
 
-  if (studentError) {
-    throw studentError;
-  }
+  if (studentError) throw studentError;
 
   const studentsById = new Map(
     (studentRows ?? []).map((student) => [student.id, student])
@@ -483,26 +490,20 @@ const fetchCloudRegistrations = async (): Promise<Registration[]> => {
     const student = studentsById.get(row.student_id);
     if (!student) return [];
 
-    return [
-      {
-        id: row.registration_id,
-        student: {
-          fullName: student.full_name ?? "",
-          registerNumber: student.register_number ?? "",
-          department: student.department ?? "",
-          year: student.year ?? "",
-          email: student.email ?? "",
-          phone: student.phone ?? "",
-        },
-        selectedEvents: Array.isArray(row.selected_events)
-          ? row.selected_events
-          : [],
-        teams: row.teams && typeof row.teams === "object"
-          ? row.teams
-          : {},
-        createdAt: row.created_at ?? "",
-      } satisfies Registration,
-    ];
+    return [{
+      id: row.registration_id,
+      student: {
+        fullName: student.full_name ?? "",
+        registerNumber: student.register_number ?? "",
+        department: student.department ?? "",
+        year: student.year ?? "",
+        email: student.email ?? "",
+        phone: student.phone ?? "",
+      },
+      selectedEvents: Array.isArray(row.selected_events) ? row.selected_events : [],
+      teams: row.teams && typeof row.teams === "object" ? row.teams : {},
+      createdAt: row.created_at ?? "",
+    } satisfies Registration];
   });
 };
 
@@ -1849,6 +1850,33 @@ function RegistrationPage({
     setStep((current) => current - 1);
   };
 
+  const checkExistingStudent = async (registerNumber: string) => {
+    const value = registerNumber.trim();
+    if (!value) return;
+
+    try {
+      const { data, error } = await supabase
+        .from("students")
+        .select("*")
+        .ilike("register_number", value)
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!data) return;
+
+      setStudent({
+        fullName: data.full_name ?? "",
+        registerNumber: data.register_number ?? value,
+        department: data.department ?? "",
+        year: data.year ?? "",
+        email: data.email ?? "",
+        phone: data.phone ?? "",
+      });
+    } catch (error) {
+      console.error("Student lookup failed:", error);
+    }
+  };
+
   const handleSubmit = async () => {
     if (
       !config.registrationEnabled ||
@@ -1879,8 +1907,8 @@ function RegistrationPage({
     }
 
     try {
-      const registerNumber =
-        student.registerNumber.trim();
+      const registerNumber = student.registerNumber.trim();
+      let currentStudent = student;
 
       // 1. CHECK EXISTING STUDENT
       const {
@@ -1929,6 +1957,7 @@ function RegistrationPage({
             existingStudent.phone ?? "",
         };
 
+        currentStudent = cloudStudent;
         setStudent(cloudStudent);
       } else {
         const {
@@ -2073,7 +2102,7 @@ function RegistrationPage({
       // 7. SUCCESS SCREEN
       const registration: Registration = {
         id: registrationId,
-        student,
+        student: currentStudent,
         selectedEvents,
         teams,
         createdAt,
@@ -2194,9 +2223,8 @@ function RegistrationPage({
           {step === 1 && (
             <StudentStep
               student={student}
-              updateStudent={
-                updateStudent
-              }
+              updateStudent={updateStudent}
+              onRegisterNumberBlur={checkExistingStudent}
             />
           )}
 
@@ -2333,12 +2361,14 @@ function RegistrationProgress({
 function StudentStep({
   student,
   updateStudent,
+  onRegisterNumberBlur,
 }: {
   student: StudentDetails;
   updateStudent: (
     field: keyof StudentDetails,
     value: string
   ) => void;
+  onRegisterNumberBlur: (registerNumber: string) => void;
 }) {
   return (
     <div className="form-step">
@@ -2384,6 +2414,7 @@ function StudentStep({
             )
           }
           placeholder="Enter register number"
+          onBlur={() => onRegisterNumberBlur(student.registerNumber)}
         />
 
         <FormField
@@ -2470,6 +2501,7 @@ function FormField({
   placeholder,
   type = "text",
   options,
+  onBlur,
 }: {
   label: string;
   value: string;
@@ -2477,6 +2509,7 @@ function FormField({
   placeholder: string;
   type?: string;
   options?: { label: string; value: string }[];
+  onBlur?: () => void;
 }) {
   return (
     <div className="form-field">
@@ -2504,6 +2537,7 @@ function FormField({
           onChange={(event) =>
             onChange(event.target.value)
           }
+          onBlur={onBlur}
         />
       )}
     </div>
@@ -3266,10 +3300,9 @@ function AdminPage({
     );
 
   const [selectedEventId, setSelectedEventId] =
-    useState(
-      getStoredEvents()[0]?.id ??
-      ""
-    );
+    useState(getStoredEvents()[0]?.id ?? "");
+
+  const [cloudHydrated, setCloudHydrated] = useState(false);
 
   const selectedEvent =
     events.find(
@@ -3279,12 +3312,52 @@ function AdminPage({
     ) ?? events[0];
 
   useEffect(() => {
+    if (!cloudHydrated) return;
     saveEvents(events);
-  }, [events]);
+    const timer = window.setTimeout(() => {
+      void saveCloudAppState(EVENTS_KEY, events).catch((error) =>
+        console.error("Unable to save events to Supabase:", error)
+      );
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [events, cloudHydrated]);
 
   useEffect(() => {
+    if (!cloudHydrated) return;
     saveConfig(config);
-  }, [config]);
+    const timer = window.setTimeout(() => {
+      void saveCloudAppState(CONFIG_KEY, config).catch((error) =>
+        console.error("Unable to save site config to Supabase:", error)
+      );
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [config, cloudHydrated]);
+
+  useEffect(() => {
+    const loadCloudState = async () => {
+      try {
+        const cloud = await fetchCloudAppState();
+        if (cloud.events) {
+          setEvents(cloud.events);
+          localStorage.setItem(EVENTS_KEY, JSON.stringify(cloud.events));
+          setSelectedEventId((current) =>
+            cloud.events?.some((event) => event.id === current)
+              ? current
+              : cloud.events?.[0]?.id ?? ""
+          );
+        }
+        if (cloud.config) {
+          setConfig({ ...DEFAULT_CONFIG, ...cloud.config });
+          localStorage.setItem(CONFIG_KEY, JSON.stringify({ ...DEFAULT_CONFIG, ...cloud.config }));
+        }
+      } catch (error) {
+        console.error("Unable to load admin data from Supabase:", error);
+      } finally {
+        setCloudHydrated(true);
+      }
+    };
+    void loadCloudState();
+  }, []);
 
   const refreshRegistrations = async () => {
     try {
@@ -6023,6 +6096,19 @@ export default function App() {
         handlePopState
       );
     };
+  }, []);
+
+  useEffect(() => {
+    const loadPublicCloudState = async () => {
+      try {
+        const cloud = await fetchCloudAppState();
+        if (cloud.events) setEvents(cloud.events);
+        if (cloud.config) setConfig({ ...DEFAULT_CONFIG, ...cloud.config });
+      } catch (error) {
+        console.error("Unable to load public cloud state:", error);
+      }
+    };
+    void loadPublicCloudState();
   }, []);
 
   useEffect(() => {
