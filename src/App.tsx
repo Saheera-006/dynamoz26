@@ -9,14 +9,9 @@ import {
   query,
   setDoc,
   where,
+  writeBatch,
 } from "firebase/firestore";
-import { db, auth } from "./firebase";
-import {
-  signInWithEmailAndPassword,
-  signOut,
-  onAuthStateChanged,
-  type User,
-} from "firebase/auth";
+import { db } from "./firebase";
 
 const DEmblem = "/d-emblem.png";
 /* =========================================================
@@ -51,11 +46,12 @@ type EventItem = {
   mode: EventMode;
   description: string;
   poster: string;
-  posterImage?: string;
+  posterImage?: string | null;
   teamSize: number;
   rules: string;
   eligibility: string;
   prize: string;
+  whatsappLink?: string;
   enabled: boolean;
   rounds: EventRound[];
 };
@@ -92,10 +88,12 @@ type SiteConfig = {
   contactEmail: string;
   contactLocation: string;
 
-  instagram: string;
-  linkedin: string;
-  youtube: string;
-  x: string;
+  studentCoordinators: Array<{
+    name: string;
+    phone: string;
+  }>;
+
+  whatsapp: string;
 
   registrationEnabled: boolean;
 };
@@ -120,10 +118,15 @@ type TeamDetails = {
 };
 
 type Registration = {
+  // Unique Firestore document / submission ID.
   id: string;
+  // Permanent registration ID for the main student for this symposium session.
+  studentRegistrationId: string;
   student: StudentDetails;
   selectedEvents: string[];
   teams: Record<string, TeamDetails>;
+  // Register number -> permanent symposium registration ID.
+  participantRegistrationIds: Record<string, string>;
   createdAt: string;
 };
 
@@ -365,10 +368,9 @@ const DEFAULT_CONFIG: SiteConfig = {
   contactEmail: "dynamoz26@example.com",
   contactLocation: "NAGERCOIL, TAMIL NADU",
 
-  instagram: "#",
-  linkedin: "#",
-  youtube: "#",
-  x: "#",
+  studentCoordinators: [],
+
+  whatsapp: "",
 
   registrationEnabled: true,
 };
@@ -435,39 +437,96 @@ const normalizeRegisterNumber = (value: string) =>
   value.trim().toLowerCase();
 
 const saveRegistration = async (registration: Registration) => {
-  const registerNumber = normalizeRegisterNumber(
-    registration.student.registerNumber
-  );
-
-  // Keep a local cache for offline-friendly admin rendering.
+  const mainRegisterNumber = normalizeRegisterNumber(registration.student.registerNumber);
   const existing = getStoredRegistrations();
-  const withoutDuplicate = existing.filter(
-    (item) =>
-      normalizeRegisterNumber(item.student.registerNumber) !==
-      registerNumber
-  );
+  localStorage.setItem(REGISTRATIONS_KEY, JSON.stringify([
+    ...existing.filter((item) => item.id !== registration.id),
+    registration,
+  ]));
 
-  localStorage.setItem(
-    REGISTRATIONS_KEY,
-    JSON.stringify([...withoutDuplicate, registration])
-  );
+  const batch = writeBatch(db);
+  batch.set(doc(db, "registrations", registration.id), {
+    ...registration,
+    studentRegisterNumber: mainRegisterNumber,
+  });
 
-  // Registration ID is used as the Firestore document ID.
-  // The register number is duplicated at top-level so Firestore can query it.
-  await setDoc(
-    doc(db, "registrations", registration.id),
-    {
-      ...registration,
-      studentRegisterNumber: registerNumber,
-    }
-  );
+  const participantEvents = new Map<string, Set<string>>();
+  const participantNames = new Map<string, string>();
+  const addEvent = (registerNumber: string, eventId: string) => {
+    if (!participantEvents.has(registerNumber)) participantEvents.set(registerNumber, new Set());
+    participantEvents.get(registerNumber)!.add(eventId);
+  };
 
-  // One canonical student document per register number.
-  await setDoc(
-    doc(db, "students", registerNumber),
-    registration.student,
-    { merge: true }
-  );
+  registration.selectedEvents.forEach((eventId) => addEvent(mainRegisterNumber, eventId));
+  participantNames.set(mainRegisterNumber, registration.student.fullName.trim());
+
+  Object.entries(registration.teams).forEach(([eventId, team]) => {
+    team.members.forEach((member) => {
+      const registerNumber = normalizeRegisterNumber(member.registerNumber);
+      if (!registerNumber) return;
+      participantNames.set(registerNumber, member.name.trim());
+      addEvent(registerNumber, eventId);
+    });
+  });
+
+  participantEvents.forEach((eventIds, registerNumber) => {
+    const registrationId = registration.participantRegistrationIds[registerNumber];
+    const registeredEvents: Record<string, unknown> = {};
+    eventIds.forEach((eventId) => {
+      registeredEvents[eventId] = {
+        registrationId,
+        registrationSubmissionId: registration.id,
+        registeredAt: registration.createdAt,
+      };
+    });
+
+    batch.set(doc(db, "students", registerNumber), {
+      ...(registerNumber === mainRegisterNumber ? registration.student : {}),
+      ...(participantNames.get(registerNumber) ? { fullName: participantNames.get(registerNumber) } : {}),
+      registerNumber,
+      registrationId,
+      registeredEvents,
+      updatedAt: registration.createdAt,
+      createdAt: registration.createdAt,
+    }, { merge: true });
+  });
+
+  await batch.commit();
+};
+
+const EVENT_POSTERS_TABLE = "events";
+
+const attachCloudPosters = async (
+  events: EventItem[]
+): Promise<EventItem[]> => {
+  try {
+    const postersSnapshot = await getDocs(
+      collection(db, EVENT_POSTERS_TABLE)
+    );
+
+    const cloudEvents = new Map<string, EventItem>();
+    postersSnapshot.docs.forEach((item) => {
+      const data = item.data() as Partial<EventItem>;
+      cloudEvents.set(item.id, {
+        ...(data as EventItem),
+        id: typeof data.id === "string" ? data.id : item.id,
+        posterImage:
+          typeof data.posterImage === "string"
+            ? data.posterImage
+            : null,
+      });
+    });
+
+    return events.map((event) => {
+      const cloudEvent = cloudEvents.get(event.id);
+      return cloudEvent
+        ? { ...event, ...cloudEvent, id: event.id }
+        : event;
+    });
+  } catch (error) {
+    console.error("Unable to load event posters from Firebase:", error);
+    return events;
+  }
 };
 
 const fetchCloudAppState = async () => {
@@ -483,9 +542,13 @@ const fetchCloudAppState = async () => {
     ? configSnap.data().value
     : null;
 
+  const baseEvents = Array.isArray(eventsData)
+    ? (eventsData as EventItem[])
+    : null;
+
   return {
-    events: Array.isArray(eventsData)
-      ? (eventsData as EventItem[])
+    events: baseEvents
+      ? await attachCloudPosters(baseEvents)
       : null,
     config:
       configData && typeof configData === "object"
@@ -498,6 +561,49 @@ const saveCloudAppState = async (
   key: string,
   value: unknown
 ) => {
+  // Every event is stored in its own Firestore document. This keeps each
+  // poster independent and avoids putting all base64 poster data into one
+  // document, which can exceed Firestore's 1 MiB document limit.
+  if (key === EVENTS_KEY && Array.isArray(value)) {
+    const events = value as EventItem[];
+
+    await Promise.all(
+      events.map((event) =>
+        setDoc(
+          doc(db, EVENT_POSTERS_TABLE, event.id),
+          {
+            ...event,
+            posterImage:
+              typeof event.posterImage === "string"
+                ? event.posterImage
+                : null,
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        )
+      )
+    );
+
+    // Keep the existing app_state document as a lightweight ordered index so
+    // the rest of the app can continue using the current loading/listener flow.
+    // No poster data is stored here.
+    const eventMetadata = events.map((event) => {
+      const { posterImage: _posterImage, ...metadata } = event;
+      return metadata;
+    });
+
+    await setDoc(
+      doc(db, APP_STATE_TABLE, key),
+      {
+        key,
+        value: eventMetadata,
+        updatedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
+    return;
+  }
+
   await setDoc(
     doc(db, APP_STATE_TABLE, key),
     {
@@ -521,6 +627,7 @@ const fetchCloudRegistrations = async (): Promise<Registration[]> => {
 
     return {
       id: data.id ?? item.id,
+      studentRegistrationId: data.studentRegistrationId ?? data.id ?? item.id,
       student: data.student,
       selectedEvents: Array.isArray(data.selectedEvents)
         ? data.selectedEvents
@@ -528,6 +635,11 @@ const fetchCloudRegistrations = async (): Promise<Registration[]> => {
       teams:
         data.teams && typeof data.teams === "object"
           ? data.teams
+          : {},
+      participantRegistrationIds:
+        data.participantRegistrationIds &&
+        typeof data.participantRegistrationIds === "object"
+          ? data.participantRegistrationIds
           : {},
       createdAt: data.createdAt ?? "",
     } satisfies Registration;
@@ -548,7 +660,7 @@ const generateId = (prefix = "id") =>
     .slice(2, 7)}`;
 
 const generateRegistrationId = () =>
-  `D26-${Date.now().toString().slice(-8)}`;
+  `reg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
 const downloadCSV = (filename: string, rows: string[][]) => {
   const csv = rows
@@ -718,22 +830,18 @@ function SocialRail({
 }: {
   config: SiteConfig;
 }) {
+  const whatsapp = config.whatsapp?.trim();
+  if (!whatsapp) return null;
+
   return (
     <div className="social-rail">
-      <a href={config.instagram} aria-label="Instagram">
-        ◎
-      </a>
-
-      <a href={config.linkedin} aria-label="LinkedIn">
-        in
-      </a>
-
-      <a href={config.youtube} aria-label="YouTube">
-        ▶
-      </a>
-
-      <a href={config.x} aria-label="X">
-        𝕏
+      <a
+        href={whatsapp}
+        target="_blank"
+        rel="noopener noreferrer"
+        aria-label="WhatsApp"
+      >
+        ☏
       </a>
     </div>
   );
@@ -869,6 +977,13 @@ function HeroSection({
           <span>{config.heroTitle}</span>
           <strong>{config.heroYear}</strong>
         </h1>
+
+        {(config.institution?.trim() || config.department?.trim()) && (
+          <div className="hero-institution">
+            {config.institution?.trim() && <strong>{config.institution}</strong>}
+            {config.department?.trim() && <span>{config.department}</span>}
+          </div>
+        )}
 
         <div className="hero-divider" />
 
@@ -1229,7 +1344,7 @@ function EventCard({
 
         <h3>{event.name}</h3>
 
-        <p>{event.description}</p>
+        {event.description?.trim() && <p>{event.description}</p>}
 
         <button
           className="event-view"
@@ -1291,7 +1406,7 @@ function EventModal({
 
           <h2>{event.name}</h2>
 
-          <p>{event.description}</p>
+          {event.description?.trim() && <p>{event.description}</p>}
 
           <div className="modal-info">
             <div>
@@ -1303,22 +1418,38 @@ function EventModal({
               </strong>
             </div>
 
-            <div>
-              <span>PRIZE</span>
-              <strong>{event.prize}</strong>
-            </div>
+            {event.prize?.trim() && (
+              <div>
+                <span>PRIZES</span>
+                <strong>{event.prize}</strong>
+              </div>
+            )}
 
-            <div>
-              <span>ELIGIBILITY</span>
-              <strong>{event.eligibility}</strong>
-            </div>
+            {event.eligibility?.trim() && (
+              <div>
+                <span>ELIGIBILITY</span>
+                <strong>{event.eligibility}</strong>
+              </div>
+            )}
           </div>
 
-          {event.rules && (
+          {event.rules?.trim() && (
             <div className="event-modal-block">
               <span>RULES</span>
               <p>{event.rules}</p>
             </div>
+          )}
+
+          {event.whatsappLink?.trim() && (
+            <a
+              className="whatsapp-event-button"
+              href={event.whatsappLink}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              JOIN WHATSAPP GROUP
+              <span>↗</span>
+            </a>
           )}
 
           {event.rounds.length > 0 && (
@@ -1516,12 +1647,16 @@ function ContactSection({
             </strong>
           </div>
 
-          <div className="contact-row">
-            <span>EMAIL</span>
-            <strong>
-              {config.contactEmail}
-            </strong>
-          </div>
+          {config.contactEmail?.trim() && (
+            <div className="contact-row">
+              <span>EMAIL</span>
+              <strong>
+                <a href={`mailto:${config.contactEmail.trim()}`}>
+                  {config.contactEmail.trim()}
+                </a>
+              </strong>
+            </div>
+          )}
 
           <div className="contact-row">
             <span>LOCATION</span>
@@ -1530,6 +1665,36 @@ function ContactSection({
             </strong>
           </div>
         </div>
+
+        {(config.studentCoordinators ?? []).filter(
+          (coordinator) =>
+            coordinator.name?.trim() &&
+            coordinator.phone?.trim()
+        ).length > 0 && (
+          <div className="contact-card student-coordinators-card">
+            <div className="student-coordinators-title">
+              STUDENT COORDINATORS
+            </div>
+
+            {(config.studentCoordinators ?? [])
+              .filter(
+                (coordinator) =>
+                  coordinator.name?.trim() &&
+                  coordinator.phone?.trim()
+              )
+              .map((coordinator, index) => (
+                <div
+                  className="contact-row student-coordinator-row"
+                  key={`${coordinator.name}-${coordinator.phone}-${index}`}
+                >
+                  <strong>{coordinator.name.trim()}</strong>
+                  <a href={`tel:${coordinator.phone.trim()}`}>
+                    {coordinator.phone.trim()}
+                  </a>
+                </div>
+              ))}
+          </div>
+        )}
       </div>
     </section>
   );
@@ -1646,6 +1811,67 @@ function RegistrationPage({
     }));
   };
 
+  // Keep the registering student permanently synced as Team Member 01
+  // in the actual team state (not only in the UI).
+  useEffect(() => {
+    if (teamEvents.length === 0) return;
+
+    setTeams((current) => {
+      let changed = false;
+      const next = { ...current };
+
+      for (const event of teamEvents) {
+        const teamSize = event.teamSize || 4;
+        const existing = next[event.id];
+
+        const members = Array.from(
+          { length: teamSize },
+          (_, index) => {
+            if (index === 0) {
+              return {
+                name: student.fullName,
+                registerNumber: student.registerNumber,
+              };
+            }
+
+            return existing?.members?.[index] ?? {
+              name: "",
+              registerNumber: "",
+            };
+          }
+        );
+
+        const nextTeam = {
+          teamName: existing?.teamName ?? "",
+          members,
+        };
+
+        const previous = existing;
+        if (
+          !previous ||
+          previous.teamName !== nextTeam.teamName ||
+          previous.members.length !== nextTeam.members.length ||
+          previous.members.some(
+            (member, index) =>
+              member.name !== nextTeam.members[index].name ||
+              member.registerNumber !==
+                nextTeam.members[index].registerNumber
+          )
+        ) {
+          next[event.id] = nextTeam;
+          changed = true;
+        }
+      }
+
+      return changed ? next : current;
+    });
+  }, [
+    student.fullName,
+    student.registerNumber,
+    selectedEvents.join("|"),
+    events,
+  ]);
+
   useEffect(() => {
     const registerNumber = student.registerNumber.trim();
     if (!registerNumber) return;
@@ -1729,9 +1955,15 @@ function RegistrationPage({
           current[eventId]?.members ??
           Array.from(
             { length: teamSize },
-            () => ({
-              name: "",
-              registerNumber: "",
+            (_, index) => ({
+              name:
+                index === 0
+                  ? student.fullName
+                  : "",
+              registerNumber:
+                index === 0
+                  ? student.registerNumber
+                  : "",
             })
           ),
       },
@@ -1756,9 +1988,15 @@ function RegistrationPage({
           teamName: "",
           members: Array.from(
             { length: teamSize },
-            () => ({
-              name: "",
-              registerNumber: "",
+            (_, memberIndex) => ({
+              name:
+                memberIndex === 0
+                  ? student.fullName
+                  : "",
+              registerNumber:
+                memberIndex === 0
+                  ? student.registerNumber
+                  : "",
             })
           ),
         };
@@ -1825,16 +2063,62 @@ function RegistrationPage({
         return false;
       }
 
-      const hasEmptyMember =
-        team.members.some(
-          (member) =>
-            !member.name.trim() ||
-            !member.registerNumber.trim()
-        );
+      const maxMembers = event.teamSize || 4;
 
-      if (hasEmptyMember) {
+      // Member 01 is always the registering student.
+      if (
+        !student.fullName.trim() ||
+        !student.registerNumber.trim()
+      ) {
         alert(
           `Please complete all team members for ${event.name}.`
+        );
+
+        return false;
+      }
+
+      // Team size is treated as a maximum. Example: if an event allows
+      // 3 members, a team with 2 members is also valid.
+      // Empty trailing member slots are allowed, but a partially filled
+      // member (only name or only register number) is not allowed.
+      const otherMembers = Array.from(
+        { length: Math.max(0, maxMembers - 1) },
+        (_, offset) =>
+          team.members[offset + 1] ?? {
+            name: "",
+            registerNumber: "",
+          }
+      );
+
+      const completeOtherMembers = otherMembers.filter((member) => {
+        const hasName = member.name.trim().length > 0;
+        const hasRegisterNumber =
+          member.registerNumber.trim().length > 0;
+
+        return hasName && hasRegisterNumber;
+      });
+
+      const hasPartialMember = otherMembers.some((member) => {
+        const hasName = member.name.trim().length > 0;
+        const hasRegisterNumber =
+          member.registerNumber.trim().length > 0;
+
+        return hasName !== hasRegisterNumber;
+      });
+
+      if (hasPartialMember) {
+        alert(
+          `Please complete the name and register number for every added team member in ${event.name}.`
+        );
+
+        return false;
+      }
+
+      // Minimum team size = 2 members:
+      // Member 01 is the registering student + at least one additional member.
+      if (completeOtherMembers.length < 1) {
+        alert(
+          `At least 2 team members are required for ${event.name}.`
         );
 
         return false;
@@ -1916,113 +2200,149 @@ function RegistrationPage({
   };
 
   const handleSubmit = async () => {
-    if (
-      !config.registrationEnabled ||
-      isRegistrationDeadlinePassed(
-        config.registrationDeadline
-      )
-    ) {
+    if (!config.registrationEnabled || isRegistrationDeadlinePassed(config.registrationDeadline)) {
       alert("Registration deadline has passed.");
       return;
     }
-
-    if (!student.registerNumber.trim()) {
-      alert("Please enter your register number.");
+    if (!student.registerNumber.trim() || !student.fullName.trim()) {
+      alert("Please complete your student details.");
       return;
     }
-
-    if (!student.fullName.trim()) {
-      alert("Please enter your full name.");
-      return;
-    }
-
     if (selectedEvents.length === 0) {
       alert("Please select at least one event.");
       return;
     }
 
     try {
-      const registerNumber = normalizeRegisterNumber(
-        student.registerNumber
+      const mainRegisterNumber = normalizeRegisterNumber(student.registerNumber);
+      const participantEvents = new Map<string, Set<string>>();
+      const participantNames = new Map<string, string>();
+
+      const addParticipantEvent = (registerNumber: string, name: string, eventId: string) => {
+        const normalized = normalizeRegisterNumber(registerNumber);
+        if (!normalized) return;
+        if (!participantEvents.has(normalized)) participantEvents.set(normalized, new Set());
+        participantEvents.get(normalized)!.add(eventId);
+        if (name.trim()) participantNames.set(normalized, name.trim());
+      };
+
+      selectedEvents.forEach((eventId) =>
+        addParticipantEvent(mainRegisterNumber, student.fullName, eventId)
       );
 
-      let currentStudent = student;
+      for (const event of teamEvents) {
+        const team = teams[event.id];
+        const memberNumbers: string[] = [];
 
-      // 1. Find the canonical student record by register number.
-      const studentSnap = await getDoc(
-        doc(db, "students", registerNumber)
+        for (const member of team?.members ?? []) {
+          const name = member.name.trim();
+          const number = normalizeRegisterNumber(member.registerNumber);
+
+          // Empty optional slots are allowed.
+          if (!name && !number) {
+            continue;
+          }
+
+          // If a member is added, both name and register number must be present.
+          if (!name || !number) {
+            alert(
+              `Please complete the name and register number for every added team member in ${event.name}.`
+            );
+            return;
+          }
+
+          // The main registrant can appear in the team members list.
+          // They are already registered for this team event through selectedEvents,
+          // so do not treat them as a duplicate participant and do not create a new student.
+          if (number === mainRegisterNumber) {
+            continue;
+          }
+
+          memberNumbers.push(number);
+          addParticipantEvent(number, name, event.id);
+        }
+
+        if (new Set(memberNumbers).size !== memberNumbers.length) {
+          alert(`A team member is entered more than once for ${event.name}.`);
+          return;
+        }
+      }
+
+      const entries = await Promise.all(
+        Array.from(participantEvents.keys()).map(async (registerNumber) => {
+          const snapshot = await getDoc(doc(db, "students", registerNumber));
+          return [registerNumber, snapshot] as const;
+        })
       );
+      const studentSnapshots = new Map(entries);
 
-      if (studentSnap.exists()) {
-        const data = studentSnap.data() as StudentDetails;
-
-        currentStudent = {
-          fullName: data.fullName ?? "",
-          registerNumber: data.registerNumber ?? student.registerNumber.trim(),
-          department: data.department ?? "",
-          year: data.year ?? "",
-          email: data.email ?? "",
-          phone: data.phone ?? "",
+      // Same student + same event is blocked, but other events are allowed.
+      for (const [registerNumber, eventIds] of participantEvents.entries()) {
+        const snapshot = studentSnapshots.get(registerNumber);
+        if (!snapshot?.exists()) continue;
+        const data = snapshot.data() as {
+          fullName?: string; registerNumber?: string;
+          registeredEvents?: Record<string, unknown>;
         };
+        const duplicates = Array.from(eventIds).filter(
+          (eventId) => Boolean(data.registeredEvents?.[eventId])
+        );
+        if (duplicates.length) {
+          const eventNames = duplicates.map((eventId) =>
+            events.find((event) => event.id === eventId)?.name ?? eventId
+          ).join(", ");
+          alert(`${data.fullName || participantNames.get(registerNumber) || registerNumber} (${data.registerNumber || registerNumber}) is already registered for: ${eventNames}`);
+          return;
+        }
+      }
 
+      const mainSnapshot = studentSnapshots.get(mainRegisterNumber);
+      let currentStudent = student;
+      let mainStudentRegistrationId = "";
+      if (mainSnapshot?.exists()) {
+        const data = mainSnapshot.data() as StudentDetails & { registrationId?: string };
+        currentStudent = {
+          fullName: data.fullName ?? student.fullName,
+          registerNumber: data.registerNumber ?? student.registerNumber.trim(),
+          department: data.department ?? student.department,
+          year: data.year ?? student.year,
+          email: data.email ?? student.email,
+          phone: data.phone ?? student.phone,
+        };
+        mainStudentRegistrationId = data.registrationId ?? "";
         setStudent(currentStudent);
       }
+      if (!mainStudentRegistrationId) mainStudentRegistrationId = generateRegistrationId();
 
-      // 2. Find previous registrations for this register number.
-      const previousSnapshot = await getDocs(
-        query(
-          collection(db, "registrations"),
-          where("studentRegisterNumber", "==", registerNumber)
-        )
-      );
-
-      const previousRegistrations = previousSnapshot.docs.map(
-        (item) => item.data() as Registration
-      );
-
-      // 3. Prevent registering for the same event twice.
-      const alreadyRegisteredEvents = previousRegistrations
-        .flatMap((registration) =>
-          Array.isArray(registration.selectedEvents)
-            ? registration.selectedEvents
-            : []
-        )
-        .filter((eventId) => selectedEvents.includes(eventId));
-
-      if (alreadyRegisteredEvents.length > 0) {
-        const eventNames = alreadyRegisteredEvents
-          .map(
-            (eventId) =>
-              events.find((event) => event.id === eventId)?.name ??
-              eventId
-          )
-          .join(", ");
-
-        alert(`Already registered for: ${eventNames}`);
-        return;
+      // One permanent ID per student for the whole DYNAMOZ session.
+      const participantRegistrationIds: Record<string, string> = {
+        [mainRegisterNumber]: mainStudentRegistrationId,
+      };
+      for (const [registerNumber, snapshot] of studentSnapshots.entries()) {
+        if (registerNumber === mainRegisterNumber) continue;
+        const data = snapshot.exists()
+          ? (snapshot.data() as { registrationId?: string })
+          : null;
+        participantRegistrationIds[registerNumber] =
+          data?.registrationId || generateRegistrationId();
       }
 
-      // 4. Create and save the new registration.
-      const registrationId = generateRegistrationId();
-      const createdAt = new Date().toISOString();
-
       const registration: Registration = {
-        id: registrationId,
+        id: generateId("registration"),
+        studentRegistrationId: mainStudentRegistrationId,
         student: currentStudent,
         selectedEvents,
         teams,
-        createdAt,
+        participantRegistrationIds,
+        createdAt: new Date().toISOString(),
       };
 
       await saveRegistration(registration);
-
       setSubmittedRegistration(registration);
       setStep(5);
     } catch (error) {
       console.error("Registration failed:", error);
-      alert(
-        "Registration failed. Please check your internet connection and try again."
-      );
+      alert("Registration failed. Please check your internet connection and try again.");
     }
   };
 
@@ -2052,15 +2372,35 @@ function RegistrationPage({
             at DYNAMOZ 26.
           </p>
 
-          <div className="success-id">
-            <span>REGISTRATION ID</span>
-            <strong>
-              {submittedRegistration.id}
-            </strong>
-          </div>
+          <p className="success-followup">
+            Stay connected with us for announcements, event updates and
+            important information.
+          </p>
+
+          {config.whatsapp?.trim() && (
+  <a
+    className="success-whatsapp-card"
+    href={config.whatsapp}
+    target="_blank"
+    rel="noopener noreferrer"
+  >
+    <div className="success-whatsapp-icon">
+      💬
+    </div>
+
+    <div className="success-whatsapp-content">
+      <strong>JOIN WHATSAPP GROUP</strong>
+      <span>Get updates & important announcements</span>
+    </div>
+
+    <div className="success-whatsapp-arrow">
+      →
+    </div>
+  </a>
+)}
 
           <button
-            className="primary-button full"
+            className="outline-button full"
             onClick={onBackHome}
           >
             BACK TO HOME
@@ -2145,6 +2485,7 @@ function RegistrationPage({
             <TeamDetailsStep
               teamEvents={teamEvents}
               teams={teams}
+              student={student}
               updateTeamName={
                 updateTeamName
               }
@@ -2315,6 +2656,7 @@ function StudentStep({
             )
           }
           placeholder="Enter register number"
+          type="number"
           onBlur={() => onRegisterNumberBlur(student.registerNumber)}
         />
 
@@ -2596,6 +2938,7 @@ function EventSelectionGroup({
 function TeamDetailsStep({
   teamEvents,
   teams,
+  student,
   updateTeamName,
   updateTeamMember,
 }: {
@@ -2604,6 +2947,7 @@ function TeamDetailsStep({
     string,
     TeamDetails
   >;
+  student: StudentDetails;
   updateTeamName: (
     eventId: string,
     name: string
@@ -2646,10 +2990,15 @@ function TeamDetailsStep({
                       event.teamSize ||
                       4,
                   },
-                  () => ({
-                    name: "",
+                  (_, index) => ({
+                    name:
+                      index === 0
+                        ? student.fullName
+                        : "",
                     registerNumber:
-                      "",
+                      index === 0
+                        ? student.registerNumber
+                        : "",
                   })
                 ),
             };
@@ -2743,9 +3092,12 @@ function TeamDetailsStep({
                       <input
                         type="text"
                         value={
-                          member.name
+                          index === 0
+                            ? student.fullName
+                            : member.name
                         }
                         placeholder="Member name"
+                        readOnly={index === 0}
                         onChange={(
                           inputEvent
                         ) =>
@@ -2763,9 +3115,12 @@ function TeamDetailsStep({
                       <input
                         type="text"
                         value={
-                          member.registerNumber
+                          index === 0
+                            ? student.registerNumber
+                            : member.registerNumber
                         }
                         placeholder="Register number"
+                        readOnly={index === 0}
                         onChange={(
                           inputEvent
                         ) =>
@@ -3068,48 +3423,30 @@ function AdminLogin({
 }: {
   onLogin: () => void;
 }) {
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [username, setUsername] =
+    useState("");
 
-  const login = async (
+  const [password, setPassword] =
+    useState("");
+
+  const login = (
     event: React.FormEvent
   ) => {
     event.preventDefault();
 
-    // Only one username is allowed.
-    if (username.trim().toLowerCase() !== "admin") {
-      alert("Invalid username or password.");
-      return;
-    }
-
-    if (!password) {
-      alert("Please enter your password.");
-      return;
-    }
-
-    setIsLoggingIn(true);
-
-    try {
-      await signInWithEmailAndPassword(
-        auth,
-        "admin@dynamoz26.com",
-        password
-      );
-
+    if (
+      username === "admin" &&
+      password === "shahith"
+    ) {
+      // Keep admin authentication only in React memory.
+      // A page refresh will reset this state and require login again.
       onLogin();
-    } catch (error) {
-      console.error(
-        "Firebase admin login error:",
-        error
+    } else {
+      alert(
+        "Invalid username or password."
       );
-
-      alert("Invalid username or password.");
-    } finally {
-      setIsLoggingIn(false);
     }
   };
-
 
   return (
     <div className="admin-login-page">
@@ -3222,6 +3559,12 @@ function AdminPage({
   const skipNextEventsSave = useRef(false);
   const skipNextConfigSave = useRef(false);
 
+  // While an admin edit is being written, do not let an older Firestore
+  // snapshot briefly overwrite the new local state (the poster "changes,
+  // then changes back" problem).
+  const pendingEventsValueRef = useRef<string | null>(null);
+  const pendingEventsWriteRef = useRef(0);
+
   const selectedEvent =
     events.find(
       (event) =>
@@ -3238,11 +3581,38 @@ function AdminPage({
     }
 
     saveEvents(events);
+
+    const serialized = JSON.stringify(events);
+    pendingEventsValueRef.current = serialized;
+
+    const writeId = pendingEventsWriteRef.current + 1;
+    pendingEventsWriteRef.current = writeId;
+
     const timer = window.setTimeout(() => {
-      void saveCloudAppState(EVENTS_KEY, events).catch((error) =>
-        console.error("Unable to save events to Firebase:", error)
-      );
-    }, 500);
+      void (async () => {
+        try {
+          await saveCloudAppState(EVENTS_KEY, events);
+        } catch (error) {
+          console.error(
+            "Unable to save events to Firebase:",
+            error
+          );
+
+          // Keep the latest local preview instead of silently replacing it
+          // with an older cloud snapshot.
+          if (
+            pendingEventsWriteRef.current === writeId
+          ) {
+            pendingEventsValueRef.current = serialized;
+          }
+
+          alert(
+            "The event changes could not be saved to Firebase. Please try again."
+          );
+        }
+      })();
+    }, 150);
+
     return () => window.clearTimeout(timer);
   }, [events, cloudHydrated]);
 
@@ -3271,18 +3641,55 @@ function AdminPage({
       doc(db, APP_STATE_TABLE, EVENTS_KEY),
       (snapshot) => {
         const value = snapshot.exists() ? snapshot.data().value : null;
+
         if (Array.isArray(value)) {
+          void attachCloudPosters(value as EventItem[])
+            .then((incomingEvents) => {
+          const incomingSerialized =
+            JSON.stringify(incomingEvents);
+
+          const pending =
+            pendingEventsValueRef.current;
+
+          // Ignore stale remote data while the admin's latest edit is
+          // waiting to be confirmed. Once Firestore sends the same value
+          // back, the edit is confirmed and normal live syncing resumes.
+          if (
+            pending &&
+            incomingSerialized !== pending
+          ) {
+            eventsReady = true;
+            if (eventsReady && configReady) {
+              setCloudHydrated(true);
+            }
+            return;
+          }
+
+          if (
+            pending &&
+            incomingSerialized === pending
+          ) {
+            pendingEventsValueRef.current = null;
+          }
+
           skipNextEventsSave.current = true;
-          setEvents(value as EventItem[]);
-          saveEvents(value as EventItem[]);
+          setEvents(incomingEvents);
+          saveEvents(incomingEvents);
+
           setSelectedEventId((current) =>
-            (value as EventItem[]).some((event) => event.id === current)
+            incomingEvents.some(
+              (event) => event.id === current
+            )
               ? current
-              : (value as EventItem[])[0]?.id ?? ""
+              : incomingEvents[0]?.id ?? ""
           );
+            });
         }
+
         eventsReady = true;
-        if (eventsReady && configReady) setCloudHydrated(true);
+        if (eventsReady && configReady) {
+          setCloudHydrated(true);
+        }
       },
       (error) => console.error("Firebase events listener error:", error)
     );
@@ -3512,13 +3919,12 @@ function AdminPage({
     );
   };
 
-  const logout = async () => {
-    try {
-      await signOut(auth);
-      onLogout();
-    } catch (error) {
-      console.error("Firebase admin logout error:", error);
-    }
+  const logout = () => {
+    localStorage.removeItem(
+      "dynamoz26_admin_auth"
+    );
+
+    onLogout();
   };
 
   if (!selectedEvent && tab === "events") {
@@ -4542,58 +4948,74 @@ function WebsiteEditor({
 
       <AdminEditorSection
         number="06"
+        title="STUDENT COORDINATORS"
+        subtitle="Add student coordinator names and phone numbers. Empty or incomplete entries stay hidden on the public website."
+      >
+        <div className="admin-stack">
+          {(config.studentCoordinators ?? []).map(
+            (coordinator, index) => (
+              <div className="admin-person-card" key={`student-coordinator-${index}`}>
+                <div className="admin-form-grid">
+                  <AdminInput
+                    label="NAME"
+                    value={coordinator.name}
+                    onChange={(value) => {
+                      const next = [...(config.studentCoordinators ?? [])];
+                      next[index] = { ...next[index], name: value };
+                      updateConfig("studentCoordinators", next);
+                    }}
+                  />
+
+                  <AdminInput
+                    label="PHONE"
+                    value={coordinator.phone}
+                    onChange={(value) => {
+                      const next = [...(config.studentCoordinators ?? [])];
+                      next[index] = { ...next[index], phone: value };
+                      updateConfig("studentCoordinators", next);
+                    }}
+                  />
+                </div>
+
+                <button
+                  className="admin-danger-button"
+                  onClick={() => {
+                    const next = (config.studentCoordinators ?? []).filter(
+                      (_, coordinatorIndex) => coordinatorIndex !== index
+                    );
+                    updateConfig("studentCoordinators", next);
+                  }}
+                >
+                  REMOVE
+                </button>
+              </div>
+            )
+          )}
+
+          <button
+            className="admin-secondary-button"
+            onClick={() =>
+              updateConfig("studentCoordinators", [
+                ...(config.studentCoordinators ?? []),
+                { name: "", phone: "" },
+              ])
+            }
+          >
+            + ADD STUDENT COORDINATOR
+          </button>
+        </div>
+      </AdminEditorSection>
+
+      <AdminEditorSection
+        number="07"
         title="SOCIAL LINKS"
-        subtitle="Update your social media links."
+        subtitle="Add a general WhatsApp link. Leave it empty to hide it from the public website."
       >
         <div className="admin-form-grid">
           <AdminInput
-            label="INSTAGRAM URL"
-            value={
-              config.instagram
-            }
-            onChange={(value) =>
-              updateConfig(
-                "instagram",
-                value
-              )
-            }
-          />
-
-          <AdminInput
-            label="LINKEDIN URL"
-            value={
-              config.linkedin
-            }
-            onChange={(value) =>
-              updateConfig(
-                "linkedin",
-                value
-              )
-            }
-          />
-
-          <AdminInput
-            label="YOUTUBE URL"
-            value={
-              config.youtube
-            }
-            onChange={(value) =>
-              updateConfig(
-                "youtube",
-                value
-              )
-            }
-          />
-
-          <AdminInput
-            label="X URL"
-            value={config.x}
-            onChange={(value) =>
-              updateConfig(
-                "x",
-                value
-              )
-            }
+            label="WHATSAPP URL"
+            value={config.whatsapp}
+            onChange={(value) => updateConfig("whatsapp", value)}
           />
         </div>
       </AdminEditorSection>
@@ -4975,6 +5397,14 @@ function EventEditor({
                     )
                   }
                 />
+
+                <AdminInput
+                  label="EVENT WHATSAPP GROUP URL"
+                  value={selectedEvent.whatsappLink ?? ""}
+                  onChange={(value) =>
+                    updateEvent(selectedEvent.id, { whatsappLink: value })
+                  }
+                />
               </AdminEditorSection>
 
               <AdminEditorSection
@@ -5323,8 +5753,14 @@ function RegistrationManager({
         "Year",
         "Email",
         "Phone",
-        "Events",
-        "Team Details",
+        "Event",
+        "Team Name",
+        "Member 1",
+        "Member 2",
+        "Member 3",
+        "Member 4",
+        "Member 5",
+        "Member 6",
         "Registered At",
       ],
     ];
@@ -5365,18 +5801,28 @@ function RegistrationManager({
             )
             .join(" || ");
 
-        rows.push([
-          registration.id,
-          registration.student.fullName,
-          registration.student.registerNumber,
-          registration.student.department,
-          registration.student.year,
-          registration.student.email,
-          registration.student.phone,
-          eventNames,
-          teamDetails || "Individual",
-          registration.createdAt,
-        ]);
+        const selectedIds = activeEvent === "all"
+          ? registration.selectedEvents
+          : registration.selectedEvents.filter((id) => id === activeEvent);
+
+        selectedIds.forEach((eventId) => {
+          const event = events.find((item) => item.id === eventId);
+          const team = registration.teams[eventId];
+          const members = team?.members ?? [];
+          rows.push([
+            registration.id,
+            registration.student.fullName,
+            `="${String(registration.student.registerNumber ?? "").replace(/"/g, '""')}"`,
+            registration.student.department,
+            registration.student.year,
+            registration.student.email,
+            registration.student.phone,
+            event?.name ?? eventId,
+            team?.teamName ?? "",
+            ...Array.from({ length: 6 }, (_, index) => members[index]?.name ?? ""),
+            registration.createdAt,
+          ]);
+        });
       }
     );
 
@@ -5729,24 +6175,252 @@ function AdminPosterUpload({
   onChange,
 }: {
   value?: string;
-  onChange: (value: string | undefined) => void;
+  onChange: (value: string | null) => void;
 }) {
-  const handleFile = (file?: File) => {
-    if (!file) return;
+  const [uploading, setUploading] =
+    useState(false);
 
-    if (!file.type.startsWith("image/")) {
-      alert("Please choose an image file.");
+  const compressPoster = (
+    file: File
+  ) =>
+    new Promise<string>(
+      (resolve, reject) => {
+        const image = new Image();
+        const objectUrl =
+          URL.createObjectURL(file);
+
+        image.onload = () => {
+          URL.revokeObjectURL(objectUrl);
+
+          // Keeping posters small is important because the current app
+          // stores the event list in one Firestore document.
+          const maxWidth = 760;
+          const scale =
+            image.width > maxWidth
+              ? maxWidth / image.width
+              : 1;
+
+          const width = Math.max(
+            1,
+            Math.round(image.width * scale)
+          );
+
+          const height = Math.max(
+            1,
+            Math.round(image.height * scale)
+          );
+
+          const canvas =
+            document.createElement("canvas");
+
+          canvas.width = width;
+          canvas.height = height;
+
+          const context =
+            canvas.getContext("2d");
+
+          if (!context) {
+            reject(
+              new Error(
+                "Unable to prepare poster image."
+              )
+            );
+            return;
+          }
+
+          context.drawImage(
+            image,
+            0,
+            0,
+            width,
+            height
+          );
+
+          const qualities = [
+            0.82,
+            0.72,
+            0.62,
+            0.52,
+            0.42,
+          ];
+
+          const maxPosterBytes =
+            45 * 1024;
+
+          const tryQuality = (
+            index: number
+          ) => {
+            canvas.toBlob(
+              (blob) => {
+                if (!blob) {
+                  reject(
+                    new Error(
+                      "Unable to compress poster image."
+                    )
+                  );
+                  return;
+                }
+
+                // If the image is still too large at the final quality,
+                // shrink the dimensions once more and retry.
+                if (
+                  blob.size > maxPosterBytes &&
+                  index ===
+                    qualities.length - 1 &&
+                  canvas.width > 420
+                ) {
+                  const smaller =
+                    document.createElement(
+                      "canvas"
+                    );
+
+                  const smallerWidth =
+                    Math.max(
+                      420,
+                      Math.round(
+                        canvas.width * 0.72
+                      )
+                    );
+
+                  const smallerHeight =
+                    Math.max(
+                      1,
+                      Math.round(
+                        canvas.height *
+                          (smallerWidth /
+                            canvas.width)
+                      )
+                    );
+
+                  smaller.width =
+                    smallerWidth;
+
+                  smaller.height =
+                    smallerHeight;
+
+                  const smallerContext =
+                    smaller.getContext("2d");
+
+                  if (!smallerContext) {
+                    reject(
+                      new Error(
+                        "Unable to resize poster image."
+                      )
+                    );
+                    return;
+                  }
+
+                  smallerContext.drawImage(
+                    canvas,
+                    0,
+                    0,
+                    smallerWidth,
+                    smallerHeight
+                  );
+
+                  canvas.width =
+                    smallerWidth;
+                  canvas.height =
+                    smallerHeight;
+
+                  context.drawImage(
+                    smaller,
+                    0,
+                    0
+                  );
+
+                  tryQuality(0);
+                  return;
+                }
+
+                const reader =
+                  new FileReader();
+
+                reader.onload = () =>
+                  resolve(
+                    String(
+                      reader.result ?? ""
+                    )
+                  );
+
+                reader.onerror = () =>
+                  reject(
+                    new Error(
+                      "Unable to read compressed poster image."
+                    )
+                  );
+
+                reader.readAsDataURL(
+                  blob
+                );
+              },
+              "image/webp",
+              qualities[index]
+            );
+          };
+
+          tryQuality(0);
+        };
+
+        image.onerror = () => {
+          URL.revokeObjectURL(objectUrl);
+
+          reject(
+            new Error(
+              "Unable to load poster image."
+            )
+          );
+        };
+
+        image.src = objectUrl;
+      }
+    );
+
+  const handleFile = async (
+    file?: File
+  ) => {
+    if (!file || uploading) return;
+
+    if (
+      !file.type.startsWith(
+        "image/"
+      )
+    ) {
+      alert(
+        "Please choose an image file."
+      );
       return;
     }
 
-    if (file.size > 5 * 1024 * 1024) {
-      alert("Poster image must be 5MB or smaller.");
+    if (
+      file.size >
+      10 * 1024 * 1024
+    ) {
+      alert(
+        "Poster image must be 10MB or smaller."
+      );
       return;
     }
 
-    const reader = new FileReader();
-    reader.onload = () => onChange(String(reader.result));
-    reader.readAsDataURL(file);
+    try {
+      setUploading(true);
+
+      const compressedPoster =
+        await compressPoster(file);
+
+      onChange(compressedPoster);
+    } catch (error) {
+      console.error(
+        "Poster processing error:",
+        error
+      );
+
+      alert(
+        "Unable to process this poster. Please try another image."
+      );
+    } finally {
+      setUploading(false);
+    }
   };
 
   return (
@@ -5756,23 +6430,50 @@ function AdminPosterUpload({
       <div className="poster-upload-box">
         <div className="poster-upload-preview">
           {value ? (
-            <img src={value} alt="Event poster preview" />
+            <img
+              src={value}
+              alt="Event poster preview"
+            />
           ) : (
             <div className="poster-upload-placeholder">
               <span>＋</span>
-              <strong>UPLOAD POSTER</strong>
-              <small>PNG, JPG or WEBP · MAX 5MB</small>
+              <strong>
+                UPLOAD POSTER
+              </strong>
+              <small>
+                PNG, JPG or WEBP · AUTO OPTIMIZED
+              </small>
             </div>
           )}
         </div>
 
         <div className="poster-upload-actions">
-          <label className="admin-upload-button">
-            {value ? "CHANGE POSTER" : "CHOOSE IMAGE"}
+          <label
+            className={`admin-upload-button ${
+              uploading
+                ? "is-uploading"
+                : ""
+            }`}
+          >
+            {uploading
+              ? "OPTIMIZING POSTER..."
+              : value
+                ? "CHANGE POSTER"
+                : "CHOOSE IMAGE"}
+
             <input
               type="file"
               accept="image/png,image/jpeg,image/webp"
-              onChange={(event) => handleFile(event.target.files?.[0])}
+              disabled={uploading}
+              onChange={(event) => {
+                void handleFile(
+                  event.target.files?.[0]
+                );
+
+                // Selecting the same image again should still trigger.
+                event.currentTarget.value =
+                  "";
+              }}
             />
           </label>
 
@@ -5780,7 +6481,13 @@ function AdminPosterUpload({
             <button
               type="button"
               className="admin-clear-button"
-              onClick={() => onChange(undefined)}
+              disabled={uploading}
+              onClick={() =>
+                // Use null, not undefined. Firestore rejects undefined
+                // values, while null is persisted and removes the poster
+                // from the website after sync.
+                onChange(null)
+              }
             >
               REMOVE
             </button>
@@ -5789,7 +6496,9 @@ function AdminPosterUpload({
       </div>
 
       <small className="admin-field-help">
-        This poster will appear directly in <strong>EXPLORE EVENTS</strong>, the event details popup and registration event selection.
+        The poster is automatically optimized before saving so it
+        reliably persists in Firebase and appears in EXPLORE EVENTS,
+        event details and registration.
       </small>
     </div>
   );
@@ -5942,6 +6651,87 @@ function PublicSite({
   events: EventItem[];
   config: SiteConfig;
 }) {
+  useEffect(() => {
+    // Scroll reveal only: no content, layout, or existing UI is changed.
+    const sections = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        "main > .section, main > section.section, .footer"
+      )
+    );
+
+    const childSelector = [
+      ".section-heading",
+      ".event-filter",
+      ".event-card",
+      ".about-copy",
+      ".about-visual",
+      ".people-card",
+      ".team-card",
+      ".contact-card",
+      ".contact-row",
+      ".footer-brand",
+      ".footer-middle",
+      ".footer-copy",
+    ].join(",");
+
+    const targets: HTMLElement[] = [];
+
+    sections.forEach((section) => {
+      section.classList.add("scroll-reveal-section");
+
+      const children = Array.from(
+        section.querySelectorAll<HTMLElement>(childSelector)
+      );
+
+      children.forEach((element, index) => {
+        element.classList.add("scroll-reveal");
+        element.style.setProperty(
+          "--scroll-reveal-delay",
+          `${Math.min(index * 70, 420)}ms`
+        );
+        targets.push(element);
+      });
+    });
+
+    // If a section has no matching child, reveal the section itself.
+    sections.forEach((section) => {
+      const hasRevealChild = Array.from(
+        section.querySelectorAll(".scroll-reveal")
+      ).length > 0;
+
+      if (!hasRevealChild) {
+        section.classList.add("scroll-reveal");
+        targets.push(section);
+      }
+    });
+
+    if (!("IntersectionObserver" in window)) {
+      targets.forEach((target) =>
+        target.classList.add("is-visible")
+      );
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (!entry.isIntersecting) return;
+
+          entry.target.classList.add("is-visible");
+          observer.unobserve(entry.target);
+        });
+      },
+      {
+        threshold: 0.12,
+        rootMargin: "0px 0px -7% 0px",
+      }
+    );
+
+    targets.forEach((target) => observer.observe(target));
+
+    return () => observer.disconnect();
+  }, [events, config]);
+
   const scrollToSection = (
     section: Section
   ) => {
@@ -6038,29 +6828,8 @@ export default function App() {
       getStoredConfig()
     );
 
-  const [adminUser, setAdminUser] = useState<User | null>(null);
-  const [authLoading, setAuthLoading] = useState(true);
-
-  const ADMIN_UID = "S5YTAtfh06YSO75Zxfqid4lgM2F3";
-
-  useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      if (user && user.uid === ADMIN_UID) {
-        setAdminUser(user);
-      } else {
-        if (user) {
-          await signOut(auth).catch((error) =>
-            console.error("Unable to sign out unauthorized user:", error)
-          );
-        }
-        setAdminUser(null);
-      }
-
-      setAuthLoading(false);
-    });
-
-    return () => unsubscribe();
-  }, []);
+  const [adminAuthenticated, setAdminAuthenticated] =
+    useState(false);
 
   useEffect(() => {
     const handlePopState =
@@ -6089,8 +6858,11 @@ export default function App() {
       (snapshot) => {
         const value = snapshot.exists() ? snapshot.data().value : null;
         if (Array.isArray(value)) {
-          setEvents(value as EventItem[]);
-          saveEvents(value as EventItem[]);
+          void attachCloudPosters(value as EventItem[])
+            .then((eventsWithPosters) => {
+              setEvents(eventsWithPosters);
+              saveEvents(eventsWithPosters);
+            });
         }
       },
       (error) => console.error("Firebase public events listener error:", error)
@@ -6187,27 +6959,35 @@ export default function App() {
     };
 
   const logoutAdmin = () => {
-    setAdminUser(null);
+    localStorage.removeItem(
+      "dynamoz26_admin_auth"
+    );
+
+    setAdminAuthenticated(
+      false
+    );
   };
 
   if (path === "/admin") {
-    if (authLoading) {
+    if (!adminAuthenticated) {
       return (
-        <div className="admin-login-page">
-          <div className="admin-login-card">
-            <img src={DEmblem} alt="DYNAMOZ" />
-            <div className="registration-kicker">DYNAMOZ 26 / SECURE ACCESS</div>
-            <h1>VERIFYING<br /><span>ACCESS</span></h1>
-          </div>
-        </div>
+        <AdminLogin
+          onLogin={() =>
+            setAdminAuthenticated(
+              true
+            )
+          }
+        />
       );
     }
 
-    if (!adminUser) {
-      return <AdminLogin onLogin={() => {}} />;
-    }
-
-    return <AdminPage onLogout={logoutAdmin} />;
+    return (
+      <AdminPage
+        onLogout={
+          logoutAdmin
+        }
+      />
+    );
   }
 
   if (registrationOpen) {
