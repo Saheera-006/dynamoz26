@@ -26,7 +26,7 @@ type Section =
   | "contact";
 
 type EventCategory = "technical" | "non-technical";
-type EventMode = "individual" | "team";
+type EventMode = "individual" | "team" | "individual-or-team";
 
 type EventRound = {
   id: string;
@@ -45,6 +45,8 @@ type EventItem = {
   category: EventCategory;
   mode: EventMode;
   description: string;
+  detailedDescription?: string;
+  theme?: string;
   poster: string;
   posterImage?: string | null;
   teamSize: number;
@@ -61,6 +63,7 @@ type Person = {
   role: string;
   name: string;
   initials: string;
+  photo?: string | null;
   description: string;
 };
 
@@ -142,6 +145,7 @@ const DEPARTMENT_OPTIONS = [
   { label: "EEE", value: "EEE" },
   { label: "MECH", value: "MECH" },
   { label: "CIVIL", value: "CIVIL" },
+  {label:  "MBA", value:   "MBA"}
 ];
 
 const DEFAULT_EVENTS: EventItem[] = [
@@ -349,6 +353,7 @@ const DEFAULT_CONFIG: SiteConfig = {
       role: "HEAD OF DEPARTMENT",
       name: "Dr. K.L. Neela",
       initials: "KN",
+      photo: null,
       description:
         "Guiding the department with vision and academic excellence.",
     },
@@ -357,6 +362,7 @@ const DEFAULT_CONFIG: SiteConfig = {
       role: "SYMPOSIUM COORDINATOR",
       name: "Dr. K. Ramesh",
       initials: "KR",
+      photo: null,
       description:
         "Orchestrating DYNAMOZ 26 with precision and passion for innovation.",
     },
@@ -978,6 +984,12 @@ function HeroSection({
           <strong>{config.heroYear}</strong>
         </h1>
 
+        <div className="hero-presented-by" aria-label="Presented by Galaxie, the technical association">
+          <span>PRESENTED BY</span>
+          <strong>GALACXIE</strong>
+          <em>THE TECHNICAL ASSOCIATION</em>
+        </div>
+
         {(config.institution?.trim() || config.department?.trim()) && (
           <div className="hero-institution">
             {config.institution?.trim() && <strong>{config.institution}</strong>}
@@ -1408,13 +1420,29 @@ function EventModal({
 
           {event.description?.trim() && <p>{event.description}</p>}
 
+          {event.theme?.trim() && (
+            <div className="event-modal-block">
+              <span>THEME</span>
+              <p>{event.theme}</p>
+            </div>
+          )}
+
+          {event.detailedDescription?.trim() && (
+            <div className="event-modal-block">
+              <span>ABOUT THE EVENT</span>
+              <p>{event.detailedDescription}</p>
+            </div>
+          )}
+
           <div className="modal-info">
             <div>
               <span>FORMAT</span>
               <strong>
                 {event.mode === "team"
-                  ? `TEAM · ${event.teamSize} MEMBERS`
-                  : "INDIVIDUAL"}
+                  ? `TEAM · UP TO ${event.teamSize} MEMBERS`
+                  : event.mode === "individual-or-team"
+                    ? "INDIVIDUAL OR TEAM"
+                    : "INDIVIDUAL"}
               </strong>
             </div>
 
@@ -1435,7 +1463,7 @@ function EventModal({
 
           {event.rules?.trim() && (
             <div className="event-modal-block">
-              <span>RULES</span>
+              <span>GUIDELINES</span>
               <p>{event.rules}</p>
             </div>
           )}
@@ -1587,7 +1615,16 @@ function PeopleSection({
               <div className="person-top-line" />
 
               <div className="person-initials">
-                {person.initials}
+                {person.photo ? (
+                  <img
+                    src={person.photo}
+                    alt={person.name}
+                    className="person-photo"
+                    loading="lazy"
+                  />
+                ) : (
+                  person.initials
+                )}
               </div>
 
               <div className="person-role">
@@ -1777,6 +1814,10 @@ function RegistrationPage({
       initialEventId ? [initialEventId] : []
     );
 
+  const [participationModes, setParticipationModes] = useState<
+    Record<string, "individual" | "team">
+  >({});
+
   const [teams, setTeams] = useState<
     Record<string, TeamDetails>
   >({});
@@ -1797,7 +1838,10 @@ function RegistrationPage({
     .filter(
       (event): event is EventItem =>
         Boolean(
-          event && event.mode === "team"
+          event &&
+            (event.mode === "team" ||
+              (event.mode === "individual-or-team" &&
+                participationModes[event.id] === "team"))
         )
     );
 
@@ -1921,20 +1965,38 @@ function RegistrationPage({
         );
 
         setTeams((existing) => {
-          const copy = {
-            ...existing,
-          };
-
+          const copy = { ...existing };
           delete copy[eventId];
-
           return copy;
+        });
+
+        setParticipationModes((modes) => {
+          const nextModes = { ...modes };
+          delete nextModes[eventId];
+          return nextModes;
         });
 
         return next;
       }
 
+      const event = activeEvents.find((item) => item.id === eventId);
+      if (event?.mode === "individual-or-team") {
+        setParticipationModes((modes) => ({ ...modes, [eventId]: modes[eventId] ?? "individual" }));
+      }
+
       return [...current, eventId];
     });
+  };
+
+  const setParticipationMode = (eventId: string, mode: "individual" | "team") => {
+    setParticipationModes((current) => ({ ...current, [eventId]: mode }));
+    if (mode === "individual") {
+      setTeams((current) => {
+        const next = { ...current };
+        delete next[eventId];
+        return next;
+      });
+    }
   };
 
   const updateTeamName = (
@@ -2472,12 +2534,10 @@ function RegistrationPage({
           {step === 2 && (
             <EventSelectionStep
               events={activeEvents}
-              selectedEvents={
-                selectedEvents
-              }
-              toggleEvent={
-                toggleEvent
-              }
+              selectedEvents={selectedEvents}
+              participationModes={participationModes}
+              toggleEvent={toggleEvent}
+              setParticipationMode={setParticipationMode}
             />
           )}
 
@@ -2689,9 +2749,7 @@ function StudentStep({
               Select year
             </option>
 
-            <option value="1st Year">
-              1st Year
-            </option>
+            
 
             <option value="2nd Year">
               2nd Year
@@ -2704,6 +2762,7 @@ function StudentStep({
             <option value="4th Year">
               4th Year
             </option>
+
           </select>
         </div>
 
@@ -2794,13 +2853,15 @@ function FormField({
 function EventSelectionStep({
   events,
   selectedEvents,
+  participationModes,
   toggleEvent,
+  setParticipationMode,
 }: {
   events: EventItem[];
   selectedEvents: string[];
-  toggleEvent: (
-    eventId: string
-  ) => void;
+  participationModes: Record<string, "individual" | "team">;
+  toggleEvent: (eventId: string) => void;
+  setParticipationMode: (eventId: string, mode: "individual" | "team") => void;
 }) {
   const technicalEvents =
     events.filter(
@@ -2837,19 +2898,19 @@ function EventSelectionStep({
       <EventSelectionGroup
         title="TECHNICAL EVENTS"
         events={technicalEvents}
-        selectedEvents={
-          selectedEvents
-        }
+        selectedEvents={selectedEvents}
+        participationModes={participationModes}
         toggleEvent={toggleEvent}
+        setParticipationMode={setParticipationMode}
       />
 
       <EventSelectionGroup
         title="NON-TECHNICAL EVENTS"
         events={nonTechnicalEvents}
-        selectedEvents={
-          selectedEvents
-        }
+        selectedEvents={selectedEvents}
+        participationModes={participationModes}
         toggleEvent={toggleEvent}
+        setParticipationMode={setParticipationMode}
       />
     </div>
   );
@@ -2859,14 +2920,16 @@ function EventSelectionGroup({
   title,
   events,
   selectedEvents,
+  participationModes,
   toggleEvent,
+  setParticipationMode,
 }: {
   title: string;
   events: EventItem[];
   selectedEvents: string[];
-  toggleEvent: (
-    eventId: string
-  ) => void;
+  participationModes: Record<string, "individual" | "team">;
+  toggleEvent: (eventId: string) => void;
+  setParticipationMode: (eventId: string, mode: "individual" | "team") => void;
 }) {
   return (
     <div className="selection-group">
@@ -2883,15 +2946,18 @@ function EventSelectionGroup({
             );
 
           return (
-            <button
+            <div
               key={event.id}
-              className={`registration-event ${selected
-                  ? "selected"
-                  : ""
-                }`}
-              onClick={() =>
-                toggleEvent(event.id)
-              }
+              className={`registration-event ${selected ? "selected" : ""}`}
+              role="button"
+              tabIndex={0}
+              onClick={() => toggleEvent(event.id)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  toggleEvent(event.id);
+                }
+              }}
             >
               <div className={`registration-event-poster ${event.posterImage ? "has-poster-image" : ""}`}>
                 {event.posterImage ? (
@@ -2909,11 +2975,19 @@ function EventSelectionGroup({
 
               <div className="registration-event-info">
                 <div className="registration-event-type">
-                  {event.mode ===
-                    "team"
-                    ? `TEAM · ${event.teamSize}`
-                    : "INDIVIDUAL"}
+                  {event.mode === "team"
+                    ? `TEAM · UP TO ${event.teamSize}`
+                    : event.mode === "individual-or-team"
+                      ? "INDIVIDUAL OR TEAM"
+                      : "INDIVIDUAL"}
                 </div>
+
+                {event.mode === "individual-or-team" && selected && (
+                  <div className="participation-mode-choice" onClick={(e) => e.stopPropagation()}>
+                    <button type="button" className={participationModes[event.id] !== "team" ? "active" : ""} onClick={() => setParticipationMode(event.id, "individual")}>INDIVIDUAL</button>
+                    <button type="button" className={participationModes[event.id] === "team" ? "active" : ""} onClick={() => setParticipationMode(event.id, "team")}>TEAM</button>
+                  </div>
+                )}
 
                 <h3>
                   {event.name}
@@ -2923,7 +2997,7 @@ function EventSelectionGroup({
                   {event.description}
                 </p>
               </div>
-            </button>
+            </div>
           );
         })}
       </div>
@@ -3436,7 +3510,7 @@ function AdminLogin({
 
     if (
       username === "admin" &&
-      password === "shahith"
+      password === "dynamoz@admin"
     ) {
       // Keep admin authentication only in React memory.
       // A page refresh will reset this state and require login again.
@@ -4479,6 +4553,107 @@ function WebsiteEditor({
     value: SiteConfig[K]
   ) => void;
 }) {
+  const [uploadingPersonId, setUploadingPersonId] =
+    useState<string | null>(null);
+
+  const compressPersonPhoto = (
+    file: File
+  ) =>
+    new Promise<string>((resolve, reject) => {
+      const image = new Image();
+      const objectUrl = URL.createObjectURL(file);
+
+      image.onload = () => {
+        URL.revokeObjectURL(objectUrl);
+
+        const maxDimension = 520;
+        const scale = Math.min(
+          1,
+          maxDimension / Math.max(image.width, image.height)
+        );
+
+        const width = Math.max(1, Math.round(image.width * scale));
+        const height = Math.max(1, Math.round(image.height * scale));
+
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+
+        const context = canvas.getContext("2d");
+        if (!context) {
+          reject(new Error("Unable to prepare staff photo."));
+          return;
+        }
+
+        context.drawImage(image, 0, 0, width, height);
+
+        const qualities = [0.82, 0.72, 0.62, 0.52, 0.42];
+        const maxBytes = 70 * 1024;
+
+        const tryQuality = (index: number) => {
+          canvas.toBlob((blob) => {
+            if (!blob) {
+              reject(new Error("Unable to compress staff photo."));
+              return;
+            }
+
+            if (blob.size > maxBytes && index < qualities.length - 1) {
+              tryQuality(index + 1);
+              return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result ?? ""));
+            reader.onerror = () =>
+              reject(new Error("Unable to read compressed staff photo."));
+            reader.readAsDataURL(blob);
+          }, "image/webp", qualities[index]);
+        };
+
+        tryQuality(0);
+      };
+
+      image.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        reject(new Error("Unable to load staff photo."));
+      };
+
+      image.src = objectUrl;
+    });
+
+  const uploadPersonPhoto = async (
+    personId: string,
+    file: File
+  ) => {
+    if (!file.type.startsWith("image/")) {
+      alert("Please select a valid image file.");
+      return;
+    }
+
+    if (file.size > 10 * 1024 * 1024) {
+      alert("Please choose an image smaller than 10 MB.");
+      return;
+    }
+
+    setUploadingPersonId(personId);
+
+    try {
+      // Only two staff photos are used. They are compressed to small WEBP
+      // data URLs and saved with the existing Firestore site config, so no
+      // Firebase Storage bucket or Storage rules are required.
+      const compressedPhoto = await compressPersonPhoto(file);
+
+      updatePerson(personId, {
+        photo: compressedPhoto,
+      });
+    } catch (error) {
+      console.error("Unable to process staff photo:", error);
+      alert("Unable to process this staff photo. Please try another image.");
+    } finally {
+      setUploadingPersonId(null);
+    }
+  };
+
   const updatePerson = (
     id: string,
     updates: Partial<Person>
@@ -4507,6 +4682,7 @@ function WebsiteEditor({
           role: "NEW ROLE",
           name: "New Person",
           initials: "NP",
+          photo: null,
           description:
             "Add person description.",
         },
@@ -4856,6 +5032,61 @@ function WebsiteEditor({
                       )
                     }
                   />
+                </div>
+
+                <div className="admin-person-photo-field">
+                  <div className="admin-person-photo-preview">
+                    {person.photo ? (
+                      <img
+                        src={person.photo}
+                        alt={person.name}
+                      />
+                    ) : (
+                      <span>{person.initials || "?"}</span>
+                    )}
+                  </div>
+
+                  <div className="admin-person-photo-actions">
+                    <div>
+                      <strong>STAFF PHOTO</strong>
+                      <small>Upload a JPG, PNG, WEBP or other image up to 5 MB.</small>
+                    </div>
+
+                    <div className="admin-person-photo-buttons">
+                      <label className="admin-photo-upload-button">
+                        {uploadingPersonId === person.id
+                          ? "UPLOADING..."
+                          : person.photo
+                            ? "CHANGE PHOTO"
+                            : "UPLOAD PHOTO"}
+                        <input
+                          type="file"
+                          accept="image/*"
+                          disabled={uploadingPersonId === person.id}
+                          onChange={(event) => {
+                            const file = event.target.files?.[0];
+                            event.currentTarget.value = "";
+                            if (file) {
+                              void uploadPersonPhoto(person.id, file);
+                            }
+                          }}
+                        />
+                      </label>
+
+                      {person.photo && (
+                        <button
+                          type="button"
+                          className="admin-photo-remove-button"
+                          disabled={uploadingPersonId === person.id}
+                          onClick={() =>
+                            updatePerson(person.id, { photo: null })
+                          }
+                        >
+                          REMOVE PHOTO
+                        </button>
+                      )}
+                    </div>
+                  </div>
                 </div>
 
                 <AdminTextarea
@@ -5251,6 +5482,9 @@ function EventEditor({
                         value:
                           "team",
                       },
+                      ...(selectedEvent.name.trim().toLowerCase() === "visual voice"
+                        ? [{ label: "Individual or Team", value: "individual-or-team" }]
+                        : []),
                     ]}
                     onChange={(value) =>
                       updateEvent(
@@ -5261,19 +5495,15 @@ function EventEditor({
                           teamSize:
                             value ===
                               "team"
-                              ? Math.max(
-                                2,
-                                selectedEvent.teamSize ||
-                                4
-                              )
+                              || value === "individual-or-team"
+                              ? Math.max(2, selectedEvent.teamSize || 4)
                               : 1,
                         }
                       )
                     }
                   />
 
-                  {selectedEvent.mode ===
-                    "team" && (
+                  {(selectedEvent.mode === "team" || selectedEvent.mode === "individual-or-team") && (
                       <AdminInput
                         label="MAX TEAM SIZE"
                         type="number"
@@ -5316,6 +5546,32 @@ function EventEditor({
                   }
                 />
 
+                <AdminInput
+                  label="THEME (OPTIONAL)"
+                  value={selectedEvent.theme ?? ""}
+                  onChange={(value) =>
+                    updateEvent(
+                      selectedEvent.id,
+                      {
+                        theme: value,
+                      }
+                    )
+                  }
+                />
+
+                <AdminTextarea
+                  label="DETAILED DESCRIPTION (OPTIONAL)"
+                  value={selectedEvent.detailedDescription ?? ""}
+                  onChange={(value) =>
+                    updateEvent(
+                      selectedEvent.id,
+                      {
+                        detailedDescription: value,
+                      }
+                    )
+                  }
+                />
+
                 <div className="admin-toggle-row">
                   <div>
                     <strong>
@@ -5350,10 +5606,10 @@ function EventEditor({
               <AdminEditorSection
                 number="02"
                 title="EVENT INFORMATION"
-                subtitle="Rules, eligibility and prize information."
+                subtitle="Guidelines, eligibility and prize information."
               >
                 <AdminTextarea
-                  label="RULES"
+                  label="GUIDELINES"
                   value={
                     selectedEvent.rules
                   }

@@ -1628,6 +1628,7 @@ img {
 
   display: grid;
   place-items: center;
+  overflow: hidden;
 
   background: #111;
 
@@ -1638,6 +1639,13 @@ img {
   font-family: "Barlow Condensed", sans-serif;
   font-size: 27px;
   font-weight: 900;
+}
+
+.person-photo {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
 }
 
 .person-role {
@@ -9390,3 +9398,250 @@ textarea:hover {
   }
 }
 
+
+
+/* =========================================================
+   ADMIN — STAFF PHOTO UPLOAD
+========================================================= */
+.admin-person-photo-field {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 18px 0;
+  padding: 14px;
+  border: 1px solid #252525;
+  background: #0b0b0b;
+}
+
+.admin-person-photo-preview {
+  width: 78px;
+  height: 78px;
+  flex: 0 0 78px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid rgba(92, 156, 88, .45);
+  background: #111;
+  color: #7BB875;
+  font: 900 25px/1 "Barlow Condensed", sans-serif;
+}
+
+.admin-person-photo-preview img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.admin-person-photo-actions {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.admin-person-photo-actions strong {
+  display: block;
+  color: #efefef;
+  font: 800 12px/1 "Barlow Condensed", sans-serif;
+  letter-spacing: 1.2px;
+}
+
+.admin-person-photo-actions small {
+  display: block;
+  margin-top: 6px;
+  color: #666;
+  font-size: 11px;
+}
+
+.admin-person-photo-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.admin-photo-upload-button,
+.admin-photo-remove-button {
+  min-height: 40px;
+  padding: 0 13px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #3a3a3a;
+  background: #101010;
+  color: #ddd;
+  cursor: pointer;
+  font: 800 10px/1 "Barlow Condensed", sans-serif;
+  letter-spacing: 1px;
+  transition: .2s ease;
+}
+
+.admin-photo-upload-button:hover {
+  border-color: #5C9C58;
+  color: #b8e2b4;
+}
+
+.admin-photo-remove-button:hover {
+  border-color: #8d5555;
+  color: #f0b5b5;
+}
+
+.admin-photo-upload-button input {
+  display: none !important;
+}
+
+.admin-photo-upload-button:has(input:disabled),
+.admin-photo-remove-button:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+@media (max-width: 800px) {
+  .admin-person-photo-field,
+  .admin-person-photo-actions {
+    align-items: flex-start;
+  }
+
+  .admin-person-photo-actions {
+    flex-direction: column;
+  }
+
+  .admin-person-photo-buttons {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 480px) {
+  .admin-person-photo-field {
+    flex-direction: column;
+  }
+
+  .admin-person-photo-actions,
+  .admin-person-photo-buttons,
+  .admin-photo-upload-button,
+  .admin-photo-remove-button {
+    width: 100%;
+  }
+}
+
+
+/* =========================================================
+   GALACXIE HERO CREDIT + VISUAL VOICE MODE CHOICE
+========================================================= */
+
+.hero-presented-by {
+  width: fit-content;
+  margin: 18px 0 24px;
+  padding: 11px 18px 11px 16px;
+  display: grid;
+  grid-template-columns: auto auto;
+  grid-template-areas:
+    "label label"
+    "name association";
+  column-gap: 14px;
+  row-gap: 4px;
+  align-items: baseline;
+  text-align: left;
+  border-left: 2px solid var(--green);
+  background: linear-gradient(
+    90deg,
+    rgba(141, 255, 61, 0.08),
+    rgba(141, 255, 61, 0.025) 62%,
+    transparent
+  );
+}
+
+.hero-presented-by span {
+  grid-area: label;
+  font-size: 0.58rem;
+  letter-spacing: 0.28em;
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.hero-presented-by strong {
+  grid-area: name;
+  color: var(--green-bright);
+  font-size: clamp(1.05rem, 1.65vw, 1.38rem);
+  font-weight: 900;
+  letter-spacing: 0.18em;
+  line-height: 1;
+  text-shadow: 0 0 18px rgba(141, 255, 61, 0.2);
+}
+
+.hero-presented-by em {
+  grid-area: association;
+  font-style: normal;
+  font-size: 0.58rem;
+  letter-spacing: 0.14em;
+  color: rgba(244, 255, 240, 0.62);
+  white-space: nowrap;
+}
+
+.registration-event {
+  cursor: pointer;
+}
+
+.registration-event:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 3px;
+}
+
+.participation-mode-choice {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0 12px;
+  padding: 6px;
+  border: 1px solid rgba(141, 255, 61, 0.12);
+  background: rgba(141, 255, 61, 0.035);
+}
+
+.participation-mode-choice button {
+  flex: 1;
+  min-height: 36px;
+  padding: 8px 10px;
+  border: 1px solid rgba(141, 255, 61, 0.2);
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  cursor: pointer;
+  transition: 0.2s ease;
+}
+
+.participation-mode-choice button:hover,
+.participation-mode-choice button.active {
+  border-color: var(--green);
+  background: rgba(141, 255, 61, 0.14);
+  color: var(--green-bright);
+  box-shadow: 0 0 18px rgba(141, 255, 61, 0.08);
+}
+
+@media (max-width: 600px) {
+  .hero-presented-by {
+    width: 100%;
+    margin: 16px 0 20px;
+    padding: 10px 12px;
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "label"
+      "name"
+      "association";
+    row-gap: 5px;
+  }
+
+  .hero-presented-by strong {
+    font-size: 1rem;
+  }
+
+  .hero-presented-by em {
+    white-space: normal;
+    font-size: 0.56rem;
+  }
+}
