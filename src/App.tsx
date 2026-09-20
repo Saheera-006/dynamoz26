@@ -1336,7 +1336,9 @@ function EventCard({
           <span className="event-badge mode">
             {event.mode === "team"
               ? `TEAM · ${event.teamSize}`
-              : "INDIVIDUAL"}
+              : event.mode === "individual-or-team"
+                ? "INDIVIDUAL OR TEAM"
+                : "INDIVIDUAL"}
           </span>
         </div>
 
@@ -5482,9 +5484,10 @@ function EventEditor({
                         value:
                           "team",
                       },
-                      ...(selectedEvent.name.trim().toLowerCase() === "visual voice"
-                        ? [{ label: "Individual or Team", value: "individual-or-team" }]
-                        : []),
+                      {
+                        label: "Individual or Team",
+                        value: "individual-or-team",
+                      },
                     ]}
                     onChange={(value) =>
                       updateEvent(
