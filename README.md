@@ -9,7 +9,6 @@
 
 # <span>DYNAMOZ'26</span>
 
-### THINK. BUILD. INNOVATE.
 
 **A Digital Symposium Experience**
 
